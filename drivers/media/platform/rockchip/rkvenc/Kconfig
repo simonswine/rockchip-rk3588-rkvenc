@@ -1,0 +1,17 @@
+config VIDEO_ROCKCHIP_RKVENC
+	tristate "Rockchip RKVENC (VEPU580) encoder driver"
+	depends on ARCH_ROCKCHIP || COMPILE_TEST
+	depends on VIDEO_DEV
+	depends on IOMMU_API
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  Support for the Rockchip VEPU580 hardware video encoder found on
+	  RK3588 SoCs. This encoder supports H.264, H.265/HEVC, and JPEG
+	  encoding at up to 8K resolution.
+
+	  This driver provides the /dev/mpp_service character device interface
+	  used by the Rockchip MPP userspace library for hardware-accelerated
+	  video encoding.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called rkvenc.
