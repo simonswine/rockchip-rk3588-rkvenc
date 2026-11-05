@@ -8,6 +8,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
@@ -18,6 +19,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 #include <linux/string.h>
 
 #include "rkvenc_hw.h"
@@ -188,91 +190,32 @@ static int rkvenc_attach_service(struct rkvenc_dev *enc)
 	return 0;
 }
 
-/* ---- SRAM RCB allocation ---- */
+/* Keep the existing register-offset machinery, but back the entire RCB
+ * window with DRAM allocated by the DMA API. No fixed IOVA reservation or
+ * manual mapping into the DMA domain is needed.
+ */
 static int rkvenc2_alloc_rcbbuf(struct platform_device *pdev, struct rkvenc_dev *enc)
 {
-	int ret;
-	u32 vals[2];
-	dma_addr_t iova;
-	u32 sram_used, sram_size;
-	struct device_node *sram_np;
-	struct resource sram_res;
-	resource_size_t sram_start, sram_end;
-	struct iommu_domain *domain;
 	struct device *dev = &pdev->dev;
+	const u32 size = SZ_1M;
+	void *cpu_addr;
+	int ret;
 
-	ret = device_property_read_u32_array(dev, "rockchip,rcb-iova", vals, 2);
+	/* RCB register addresses are 32-bit. */
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
 
-	iova = PAGE_ALIGN(vals[0]);
-	sram_used = PAGE_ALIGN(vals[1]);
-	if (!sram_used) {
-		dev_err(dev, "sram rcb invalid\n");
-		return -EINVAL;
-	}
-
-	sram_np = of_parse_phandle(dev->of_node, "rockchip,sram", 0);
-	if (!sram_np) {
-		dev_err(dev, "could not find phandle sram\n");
-		return -ENODEV;
-	}
-
-	ret = of_address_to_resource(sram_np, 0, &sram_res);
-	of_node_put(sram_np);
-	if (ret) {
-		dev_err(dev, "find sram res error\n");
-		return ret;
-	}
-
-	sram_start = round_up(sram_res.start, PAGE_SIZE);
-	sram_end = round_down(sram_res.start + resource_size(&sram_res), PAGE_SIZE);
-	if (sram_end <= sram_start) {
-		dev_err(dev, "no available sram\n");
+	cpu_addr = dmam_alloc_coherent(dev, size, &enc->sram_iova, GFP_KERNEL);
+	if (!cpu_addr)
 		return -ENOMEM;
-	}
-	sram_size = sram_end - sram_start;
-	sram_size = sram_used < sram_size ? sram_used : sram_size;
 
-	if (!enc->iommu_info || !enc->iommu_info->domain)
-		return -ENODEV;
-
-	domain = enc->iommu_info->domain;
-	ret = iommu_map(domain, iova, sram_start, sram_size, IOMMU_READ | IOMMU_WRITE,
-			GFP_KERNEL);
-	if (ret) {
-		dev_err(dev, "sram iommu_map error\n");
-		return ret;
-	}
-
-	if (sram_size < sram_used) {
-		struct page *page;
-		size_t page_size = PAGE_ALIGN(sram_used - sram_size);
-
-		page = alloc_pages(GFP_KERNEL | __GFP_ZERO, get_order(page_size));
-		if (!page) {
-			dev_err(dev, "unable to allocate pages\n");
-			iommu_unmap(domain, iova, sram_size);
-			return -ENOMEM;
-		}
-		ret = iommu_map(domain, iova + sram_size, page_to_phys(page),
-				page_size, IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
-		if (ret) {
-			dev_err(dev, "page iommu_map error\n");
-			__free_pages(page, get_order(page_size));
-			iommu_unmap(domain, iova, sram_size);
-			return ret;
-		}
-		enc->rcb_page = page;
-	}
-
-	enc->sram_size = sram_size;
-	enc->sram_used = sram_used;
-	enc->sram_iova = iova;
+	/* Both limits cover DRAM now; retain the upstream field names. */
+	enc->sram_size = size;
+	enc->sram_used = size;
 	enc->sram_enabled = -1;
-	dev_info(dev, "sram iova %pad size %u used %u\n",
-		 &enc->sram_iova, enc->sram_size, enc->sram_used);
-
+	dev_info(dev, "DRAM RCB DMA address %pad size %u\n",
+		 &enc->sram_iova, size);
 	return 0;
 }
 
@@ -318,13 +261,12 @@ static int rkvenc_core_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * Try SRAM allocation (optional, non-fatal).
-	 * For secondary cores sharing a CCU domain, the main core has
-	 * already mapped the SRAM into the shared domain.  Just inherit
-	 * the SRAM info so rkvenc2_set_rcbbuf() works on both cores.
+	 * Only allocate through the main core's DMA device: the secondary
+	 * core is attached to its domain, but does not own its DMA allocator.
+	 * The managed allocation is released after hardware removal.
 	 */
 	if (enc->ccu && enc != enc->ccu->main_core &&
-	    enc->ccu->main_core->sram_iova) {
+	    enc->ccu->main_core->sram_used) {
 		enc->sram_iova = enc->ccu->main_core->sram_iova;
 		enc->sram_size = enc->ccu->main_core->sram_size;
 		enc->sram_used = enc->ccu->main_core->sram_used;
@@ -332,7 +274,11 @@ static int rkvenc_core_probe(struct platform_device *pdev)
 		dev_info(dev, "sram inherited from main core: iova %pad size %u used %u\n",
 			 &enc->sram_iova, enc->sram_size, enc->sram_used);
 	} else {
-		rkvenc2_alloc_rcbbuf(pdev, enc);
+		ret = rkvenc2_alloc_rcbbuf(pdev, enc);
+		if (ret) {
+			dev_err(dev, "RCB DMA allocation failed: %d\n", ret);
+			goto err_hw;
+		}
 	}
 
 	/* Register IRQ */
@@ -354,6 +300,15 @@ static int rkvenc_core_probe(struct platform_device *pdev)
 	return 0;
 
 err_hw:
+	/* Do not leave a failed probe in the shared CCU's core list. */
+	if (enc->ccu) {
+		mutex_lock(&enc->ccu->lock);
+		list_del_init(&enc->core_link);
+		enc->ccu->core_num--;
+		if (enc->ccu->main_core == enc)
+			enc->ccu->main_core = NULL;
+		mutex_unlock(&enc->ccu->lock);
+	}
 	rkvenc_hw_remove(enc);
 	return ret;
 }
@@ -371,20 +326,6 @@ static int rkvenc_core_remove(struct platform_device *pdev)
 		list_del_init(&enc->core_link);
 		enc->ccu->core_num--;
 		mutex_unlock(&enc->ccu->lock);
-	}
-
-	/* Free SRAM — only the core that mapped it (main or standalone) */
-	if (enc->sram_iova && enc->iommu_info && enc->iommu_info->domain &&
-	    (!enc->ccu || enc == enc->ccu->main_core)) {
-		struct iommu_domain *domain = enc->iommu_info->domain;
-
-		if (enc->rcb_page) {
-			size_t page_size = PAGE_ALIGN(enc->sram_used - enc->sram_size);
-
-			iommu_unmap(domain, enc->sram_iova + enc->sram_size, page_size);
-			__free_pages(enc->rcb_page, get_order(page_size));
-		}
-		iommu_unmap(domain, enc->sram_iova, enc->sram_size);
 	}
 
 	rkvenc_hw_remove(enc);
