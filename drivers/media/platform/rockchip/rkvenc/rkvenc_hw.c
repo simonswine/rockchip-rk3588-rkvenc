@@ -157,7 +157,7 @@ static int rkvenc_get_class_msg(struct rkvenc_task *task,
 		u32 base_s = hw->reg_msg[i].base_s;
 		u32 base_e = hw->reg_msg[i].base_e;
 
-		if (addr >= base_s && addr < base_e) {
+		if (addr >= base_s && addr <= base_e) {
 			msg->offset = base_s;
 			msg->size = task->reg[i].size;
 			msg->data = task->reg[i].data;
@@ -178,7 +178,9 @@ static u32 *rkvenc_get_class_reg(struct rkvenc_task *task, u32 addr)
 		u32 base_s = hw->reg_msg[i].base_s;
 		u32 base_e = hw->reg_msg[i].base_e;
 
-		if (addr >= base_s && addr < base_e) {
+		if (addr >= base_s && addr <= base_e) {
+			if (!task->reg[i].data)
+				return NULL;
 			reg = (u8 *)task->reg[i].data + (addr - base_s);
 			break;
 		}
@@ -360,7 +362,7 @@ static void rkvenc2_read_slice_len(struct rkvenc_dev *mpp,
 		last |= slice_info.last;
 		if (last && i == sli_num - 1) {
 			task->last_slice_found = 1;
-			break;
+			slice_info.last = 1;
 		}
 
 		if (split) {

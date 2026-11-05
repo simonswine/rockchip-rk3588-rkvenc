@@ -84,7 +84,6 @@ void rkvenc_session_put(struct rkvenc_session *session)
 static int rkvenc_session_attach_device(struct rkvenc_session *session,
 					struct rkvenc_dev *mpp)
 {
-	session->mpp = mpp;
 	session->dma = rkvenc_dma_session_create(mpp->dev,
 						 mpp->session_max_buffers);
 	if (!session->dma) {
@@ -92,6 +91,7 @@ static int rkvenc_session_attach_device(struct rkvenc_session *session,
 		return -ENOMEM;
 	}
 
+	session->mpp = mpp;
 	session->core_dma[mpp->core_id] = session->dma;
 	return 0;
 }
@@ -137,7 +137,7 @@ static bool req_over_class(struct mpp_request *req,
 {
 	const struct rkvenc_hw_info *hw = task->hw_info;
 	/* BSP overlap check is inclusive; use last dword of request (offset+size-4). */
-	u32 req_e = req->offset + req->size - sizeof(u32);
+	u32 req_e = req->offset + (req->size - sizeof(u32));
 	u32 base_s = hw->reg_msg[class].base_s;
 	u32 base_e = hw->reg_msg[class].base_e;
 
@@ -172,7 +172,8 @@ static int rkvenc2_extract_rcb_info(struct rkvenc2_rcb_info *rcb_inf,
 	int max_size = ARRAY_SIZE(rcb_inf->elem);
 	int cnt = req->size / sizeof(rcb_inf->elem[0]);
 
-	if (req->size > sizeof(rcb_inf->elem)) {
+	if (req->size % sizeof(rcb_inf->elem[0]) ||
+	    req->size > sizeof(rcb_inf->elem)) {
 		rkvenc_err("count %d, max_size %d\n", cnt, max_size);
 		return -EINVAL;
 	}
@@ -200,6 +201,15 @@ static int rkvenc_extract_task_msg(struct rkvenc_session *session,
 		if (!req->size)
 			continue;
 
+		if ((req->cmd == MPP_CMD_SET_REG_WRITE ||
+		     req->cmd == MPP_CMD_SET_REG_READ) &&
+		    (!IS_ALIGNED(req->offset, sizeof(u32)) ||
+		     !IS_ALIGNED(req->size, sizeof(u32)) ||
+		     req->offset > U32_MAX - (req->size - sizeof(u32)))) {
+			ret = -EINVAL;
+			goto fail;
+		}
+
 		switch (req->cmd) {
 		case MPP_CMD_SET_REG_WRITE: {
 			void *data;
@@ -212,6 +222,10 @@ static int rkvenc_extract_task_msg(struct rkvenc_session *session,
 				ret = rkvenc_alloc_class_msg(task, j);
 				if (ret) {
 					rkvenc_err("alloc class msg %d fail.\n", j);
+					goto fail;
+				}
+				if (task->w_req_cnt >= ARRAY_SIZE(task->w_reqs)) {
+					ret = -E2BIG;
 					goto fail;
 				}
 				wreq = &task->w_reqs[task->w_req_cnt];
@@ -243,6 +257,10 @@ static int rkvenc_extract_task_msg(struct rkvenc_session *session,
 					rkvenc_err("alloc class msg reg %d fail.\n", j);
 					goto fail;
 				}
+				if (task->r_req_cnt >= ARRAY_SIZE(task->r_reqs)) {
+					ret = -E2BIG;
+					goto fail;
+				}
 				rreq = &task->r_reqs[task->r_req_cnt];
 				rkvenc_update_req(task, j, req, rreq);
 				task->reg[j].valid = 1;
@@ -250,13 +268,18 @@ static int rkvenc_extract_task_msg(struct rkvenc_session *session,
 			}
 		} break;
 		case MPP_CMD_SET_REG_ADDR_OFFSET: {
-			rkvenc_extract_reg_offset_info(&task->off_inf, req);
+			ret = rkvenc_extract_reg_offset_info(&task->off_inf, req);
+			if (ret)
+				goto fail;
 		} break;
 		case MPP_CMD_SET_RCB_INFO: {
 			struct rkvenc2_session_priv *priv = session->priv;
 
-			if (priv)
-				rkvenc2_extract_rcb_info(&priv->rcb_inf, req);
+			if (priv) {
+				ret = rkvenc2_extract_rcb_info(&priv->rcb_inf, req);
+				if (ret)
+					goto fail;
+			}
 		} break;
 		default:
 			break;
@@ -341,49 +364,41 @@ static void rkvenc2_check_split_task(struct rkvenc_dev *mpp, struct rkvenc_task 
 		INIT_KFIFO(task->slice_info);
 }
 
-/* ---- Set RCB buffer addresses from SRAM ---- */
-static void rkvenc2_set_rcbbuf(struct rkvenc_dev *enc,
-			       struct rkvenc_session *session,
-			       struct rkvenc_task *task)
+/* ---- Set per-core DRAM RCB addresses from this task's snapshot ---- */
+static int rkvenc2_set_rcbbuf(struct rkvenc_dev *enc, struct rkvenc_task *task)
 {
-	struct rkvenc2_session_priv *priv = session->priv;
+	const struct rkvenc_hw_info *hw = task->hw_info;
+	u32 offset = 0;
+	int i;
 
-	if (priv && enc->sram_iova) {
-		int i;
-		u32 *reg;
-		u32 reg_idx, rcb_size, rcb_offset;
-		struct rkvenc2_rcb_info *rcb_inf = &priv->rcb_inf;
+	for (i = 0; i < task->rcb_inf.cnt; i++) {
+		u32 index = task->rcb_inf.elem[i].index;
+		u32 size = task->rcb_inf.elem[i].size;
+		u32 addr;
+		int c;
 
-		rcb_offset = 0;
-		for (i = 0; i < rcb_inf->cnt; i++) {
-			reg_idx = rcb_inf->elem[i].index;
-			rcb_size = rcb_inf->elem[i].size;
+		if (index > U32_MAX / sizeof(u32))
+			return -EINVAL;
+		addr = index * sizeof(u32);
+		/* Retain the userspace DRAM mapping if scratch space is exhausted. */
+		if (size > enc->sram_used - offset)
+			continue;
+		for (c = 0; c < hw->reg_class; c++) {
+			u32 base = hw->reg_msg[c].base_s;
 
-			if (rcb_offset > enc->sram_size ||
-			    (rcb_offset + rcb_size) > enc->sram_used)
+			if (addr < base || addr > hw->reg_msg[c].base_e)
 				continue;
-
-			/* Get class reg for the RCB register index */
-			{
-				const struct rkvenc_hw_info *hw = task->hw_info;
-				int c;
-
-				for (c = 0; c < hw->reg_class; c++) {
-					u32 bs = hw->reg_msg[c].base_s;
-					u32 be = hw->reg_msg[c].base_e;
-					u32 addr = reg_idx * sizeof(u32);
-
-					if (addr >= bs && addr < be) {
-						reg = (u32 *)((u8 *)task->reg[c].data + (addr - bs));
-						*reg = enc->sram_iova + rcb_offset;
-						break;
-					}
-				}
-			}
-
-			rcb_offset += rcb_size;
+			if (!task->reg[c].data)
+				return -EINVAL;
+			task->reg[c].data[(addr - base) / sizeof(u32)] =
+				enc->sram_iova + offset;
+			break;
 		}
+		if (c == hw->reg_class)
+			return -EINVAL;
+		offset += size;
 	}
+	return 0;
 }
 
 /* ---- Alloc task from session ---- */
@@ -403,12 +418,22 @@ static struct rkvenc_task *rkvenc_alloc_task(struct rkvenc_session *session,
 	rkvenc_task_init(session, mpp_task);
 	mpp_task->hw_info = &mpp->hw_info->hw;
 	task->hw_info = mpp->hw_info;
+	task->core_mask = BIT(mpp->core_id);
+	if (!(msgs->flags & MPP_FLAGS_REG_FD_NO_TRANS)) {
+		int i;
+
+		for (i = 0; i < RKVENC_MAX_CORE_NUM; i++)
+			if (mpp->queue->cores[i])
+				__set_bit(i, &task->core_mask);
+	}
 
 	/* extract reqs for current task */
 	ret = rkvenc_extract_task_msg(session, task, msgs);
 	if (ret)
 		goto free_task;
 	mpp_task->reg = task->reg[0].data;
+	if (session->priv)
+		task->rcb_inf = ((struct rkvenc2_session_priv *)session->priv)->rcb_inf;
 
 	/* get format */
 	ret = rkvenc_task_get_format(mpp, task);
@@ -447,10 +472,16 @@ static struct rkvenc_task *rkvenc_alloc_task(struct rkvenc_session *session,
 			if (ret)
 				goto fail;
 
-			cnt = mpp->trans_info[fmt].count;
-			tbl = mpp->trans_info[fmt].table;
+			cnt = session->trans_count ? session->trans_count :
+				mpp->trans_info[fmt].count;
+			tbl = session->trans_count ? session->trans_table :
+				mpp->trans_info[fmt].table;
 			for (j = 0; j < cnt; j++) {
 				off = rkvenc_query_reg_offset_info(&task->off_inf, tbl[j] + ss);
+				if (off > U32_MAX - reg[tbl[j]]) {
+					ret = -EINVAL;
+					goto fail;
+				}
 				reg[tbl[j]] += off;
 			}
 
@@ -528,8 +559,8 @@ static struct rkvenc_task *rkvenc_alloc_task(struct rkvenc_session *session,
 
 fail:
 	rkvenc_task_finalize(session, mpp_task);
-	rkvenc_free_class_msg(task);
 free_task:
+	rkvenc_free_class_msg(task);
 	kfree(task);
 	return NULL;
 }
@@ -551,7 +582,7 @@ static int rkvenc_result(struct rkvenc_dev *mpp,
 		/* Find class for this read request offset */
 		for (c = 0; c < hw->reg_class; c++) {
 			if (req->offset >= hw->reg_msg[c].base_s &&
-			    req->offset < hw->reg_msg[c].base_e) {
+			    req->offset <= hw->reg_msg[c].base_e) {
 				class_base = hw->reg_msg[c].base_s;
 				reg = (u32 *)((u8 *)task->reg[c].data + (req->offset - class_base));
 				break;
@@ -650,24 +681,25 @@ void rkvenc_task_worker_default(struct kthread_work *work)
 		for (i = 0; i < RKVENC_MAX_CORE_NUM; i++)
 			if (queue->cores[i] && !queue->cores[i]->disable)
 				__set_bit(i, &usable);
-		core_idle = queue->core_idle & usable;
-		core_id = find_first_bit(&core_idle, queue->core_id_max + 1);
+		pending_task = list_first_entry_or_null(&queue->pending_list,
+				struct rkvenc_mpp_task, queue_link);
+		if (pending_task) {
+			struct rkvenc_task *head = container_of(pending_task,
+						struct rkvenc_task, mpp_task);
 
-		if (core_id <= queue->core_id_max && queue->cores[core_id]) {
-			pending_task = list_first_entry_or_null(&queue->pending_list,
-								struct rkvenc_mpp_task,
-								queue_link);
-			if (pending_task) {
+			usable &= head->core_mask;
+			core_idle = queue->core_idle & usable;
+			core_id = find_first_bit(&core_idle, RKVENC_MAX_CORE_NUM);
+			if (core_id < RKVENC_MAX_CORE_NUM) {
 				list_del_init(&pending_task->queue_link);
 				clear_bit(core_id, &queue->core_idle);
 				pending_task->mpp = queue->cores[core_id];
 				pending_task->core_id = core_id;
-			}
-		} else if (!usable) {
-			pending_task = list_first_entry_or_null(&queue->pending_list,
-					struct rkvenc_mpp_task, queue_link);
-			if (pending_task)
+			} else if (!usable) {
 				list_del_init(&pending_task->queue_link);
+			} else {
+				pending_task = NULL;
+			}
 		}
 		spin_unlock_irqrestore(&queue->running_lock, flags);
 		mutex_unlock(&queue->pending_lock);
@@ -687,8 +719,9 @@ void rkvenc_task_worker_default(struct kthread_work *work)
 			int run_ret;
 
 			run_ret = rkvenc_place_task(enc_task, target->core_id);
+			if (!run_ret)
+				run_ret = rkvenc2_set_rcbbuf(target, enc_task);
 			if (!run_ret) {
-				rkvenc2_set_rcbbuf(target, pending_task->session, enc_task);
 				set_bit(TASK_STATE_RUNNING, &pending_task->state);
 				run_ret = rkvenc_hw_run(target, pending_task);
 			}
@@ -738,6 +771,8 @@ static int rkvenc_process_request(struct rkvenc_session *session,
 		if (get_user(client_type, (u32 __user *)req->data))
 			return -EFAULT;
 
+		if (client_type != MPP_DEVICE_RKVENC)
+			return -ENODEV;
 		session->device_type = client_type;
 
 		/* Attach to the encoder device */
@@ -745,8 +780,13 @@ static int rkvenc_process_request(struct rkvenc_session *session,
 			struct rkvenc_dev *dev =
 				session->srv->sub_devices[MPP_DEVICE_RKVENC];
 
-			if (dev)
-				rkvenc_session_attach_device(session, dev);
+			int ret;
+
+			if (!dev)
+				return -ENODEV;
+			ret = rkvenc_session_attach_device(session, dev);
+			if (ret)
+				return ret;
 		}
 
 		/* Init session private data */
@@ -754,16 +794,17 @@ static int rkvenc_process_request(struct rkvenc_session *session,
 			struct rkvenc2_session_priv *priv;
 
 			priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-			if (priv) {
-				init_rwsem(&priv->rw_sem);
-				session->priv = priv;
-			}
+			if (!priv)
+				return -ENOMEM;
+			init_rwsem(&priv->rw_sem);
+			session->priv = priv;
 		}
 	} break;
 	case MPP_CMD_INIT_TRANS_TABLE: {
 		int cnt = req->size / sizeof(u16);
 
-		if (cnt > MPP_MAX_REG_TRANS_NUM) {
+		if (req->size % sizeof(u16) ||
+		    req->size > sizeof(session->trans_table)) {
 			rkvenc_err("trans count %d too large\n", cnt);
 			return -EINVAL;
 		}
@@ -784,26 +825,47 @@ static int rkvenc_process_request(struct rkvenc_session *session,
 		msgs->poll_req = req;
 	} break;
 	case MPP_CMD_TRANS_FD_TO_IOVA: {
-		/* Static FD->IOVA translation for buffer pre-import */
-		if (session->mpp && session->dma) {
-			u32 fd;
+		u32 fds[MPP_MAX_REG_TRANS_NUM];
+		u32 i;
 
-			if (get_user(fd, (u32 __user *)req->data))
-				return -EFAULT;
+		if (!session->dma || !req->size ||
+		    req->size % sizeof(u32) || req->size > sizeof(fds))
+			return -EINVAL;
+		if (copy_from_user(fds, req->data, req->size))
+			return -EFAULT;
+		for (i = 0; i < req->size / sizeof(u32); i++) {
+			struct rkvenc_dma_buffer *buf;
 
 			rkvenc_iommu_down_read(session->mpp->iommu_info);
-			rkvenc_dma_import_fd(session->mpp->iommu_info, session->dma, fd, 1);
+			buf = rkvenc_dma_import_fd(session->mpp->iommu_info,
+						   session->dma, fds[i], 1);
 			rkvenc_iommu_up_read(session->mpp->iommu_info);
+			if (IS_ERR(buf))
+				return PTR_ERR(buf);
+			fds[i] = buf->iova;
 		}
+		if (copy_to_user(req->data, fds, req->size))
+			return -EFAULT;
 	} break;
 	case MPP_CMD_RELEASE_FD: {
-		if (session->dma) {
-			u32 fd;
+		u32 fds[MPP_MAX_REG_TRANS_NUM];
+		u32 i;
+		int ret;
 
-			if (get_user(fd, (u32 __user *)req->data))
-				return -EFAULT;
-			rkvenc_dma_release_fd(session->dma, fd);
+		if (!session->dma || !req->size ||
+		    req->size % sizeof(u32) || req->size > sizeof(fds))
+			return -EINVAL;
+		if (copy_from_user(fds, req->data, req->size))
+			return -EFAULT;
+		rkvenc_iommu_down_read(session->mpp->iommu_info);
+		for (i = 0; i < req->size / sizeof(u32); i++) {
+			ret = rkvenc_dma_release_fd(session->dma, fds[i]);
+			if (ret) {
+				rkvenc_iommu_up_read(session->mpp->iommu_info);
+				return ret;
+			}
 		}
+		rkvenc_iommu_up_read(session->mpp->iommu_info);
 	} break;
 	case MPP_CMD_SEND_CODEC_INFO: {
 		/* Codec info is optional, just store it */

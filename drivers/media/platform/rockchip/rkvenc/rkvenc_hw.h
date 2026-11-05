@@ -547,6 +547,16 @@ struct rkvenc_poll_slice_cfg {
 
 #define RKVENC_SLICE_FIFO_LEN	512
 
+struct rkvenc2_rcb_info_elem {
+	u32 index;
+	u32 size;
+};
+
+struct rkvenc2_rcb_info {
+	u32 cnt;
+	struct rkvenc2_rcb_info_elem elem[20];
+};
+
 struct rkvenc_task {
 	struct rkvenc_mpp_task mpp_task;
 	const struct rkvenc_hw_info *hw_info;
@@ -558,8 +568,14 @@ struct rkvenc_task {
 	u32 w_req_cnt;
 	u32 r_req_cnt;
 
+	/* Snapshot scratch layout; later submissions may change session RCB info. */
+	struct rkvenc2_rcb_info rcb_inf;
+
 	/* Register offset info */
 	struct reg_offset_info off_inf;
+
+	/* Raw IOVAs are valid only on the session's main core. */
+	unsigned long core_mask;
 
 	/* Format and flags */
 	u32 fmt;
@@ -638,15 +654,6 @@ struct rkvenc_task_msgs {
 };
 
 /* ---- Session private data ---- */
-struct rkvenc2_rcb_info_elem {
-	u32 index;
-	u32 size;
-};
-
-struct rkvenc2_rcb_info {
-	u32 cnt;
-	struct rkvenc2_rcb_info_elem elem[20];
-};
 
 enum {
 	ENC_INFO_BASE = 0,

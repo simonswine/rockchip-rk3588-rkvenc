@@ -250,9 +250,18 @@ int rkvenc_translate_reg_address(struct rkvenc_session *session,
 	}
 
 	for (i = 0; i < cnt; i++) {
+		struct rkvenc_task *enc_task = container_of(task, struct rkvenc_task,
+							 mpp_task);
+		int j;
 		int usr_fd;
 		u32 offset;
 		struct rkvenc_mem_region *mem_region;
+
+		if (tbl[i] >= enc_task->reg[reg_class].size / sizeof(u32))
+			return -EINVAL;
+		for (j = 0; j < i; j++)
+			if (tbl[j] == tbl[i])
+				return -EINVAL;
 
 		if (session->msg_flags & MPP_FLAGS_REG_NO_OFFSET) {
 			usr_fd = reg[tbl[i]];
@@ -273,6 +282,9 @@ int rkvenc_translate_reg_address(struct rkvenc_session *session,
 		}
 		mem_region->reg_class = reg_class;
 		mem_region->reg_idx = tbl[i];
+		if (offset > mem_region->len ||
+		    (u64)mem_region->iova + offset > U32_MAX)
+			return -EINVAL;
 		reg[tbl[i]] = mem_region->iova + offset;
 	}
 
@@ -285,7 +297,9 @@ int rkvenc_extract_reg_offset_info(struct reg_offset_info *off_inf,
 	int max_size = ARRAY_SIZE(off_inf->elem);
 	int cnt = req->size / sizeof(off_inf->elem[0]);
 
-	if ((cnt + off_inf->cnt) > max_size) {
+	if (req->size % sizeof(off_inf->elem[0]) ||
+	    req->size > sizeof(off_inf->elem) -
+			off_inf->cnt * sizeof(off_inf->elem[0])) {
 		rkvenc_err("count %d, total %d, max_size %d\n",
 			   cnt, off_inf->cnt, max_size);
 		return -EINVAL;
