@@ -33,7 +33,8 @@ sudo depmod -a
 The kernel must have module support, the Rockchip IOMMU, DMA/IOMMU support,
 and media/video support enabled. For cross-compiling, pass `ARCH=arm64` and
 an appropriate `CROSS_COMPILE` prefix. Output:
-`drivers/media/platform/rockchip/rkvenc/rkvenc.ko`.
+`rkvenc.ko` in the repository root. Module object definitions are in `Kbuild`;
+`Makefile` provides the standalone build, install, clean, and test targets.
 
 Do not install alongside another implementation of `rkvenc`. On NixOS,
 package this source through `kernel.moduleBuildDependencies` and install the
@@ -42,7 +43,7 @@ running system's store paths.
 
 ## Device tree and runtime
 
-`dts/rk3588-rkvenc.dtso` supplies the hardware nodes for an Orange Pi 5 Plus.
+`rk3588-rkvenc.dtso` supplies the hardware nodes for an Orange Pi 5 Plus.
 Compile it with the target kernel's DT include paths and apply it through
 your boot/device-tree tooling, then reboot before loading `rkvenc`.
 
@@ -84,12 +85,12 @@ fields, inclusive register endpoints, alignment/overflow, and offset-array
 bounds. They do not exercise DMA, interrupts, runtime PM, or scheduling.
 
 For controlled dual-core testing, compile/apply
-`dts/rk3588-rkvenc-dual.dtso` **instead of** the default single-core overlay.
+`rk3588-rkvenc-dual.dtso` **instead of** the default single-core overlay.
 For example, using the matching kernel source include directory:
 
 ```sh
 cc -E -P -x assembler-with-cpp -nostdinc -undef \
-  -I/path/to/kernel/source/include dts/rk3588-rkvenc-dual.dtso \
+  -I/path/to/kernel/source/include rk3588-rkvenc-dual.dtso \
   -o /tmp/rkvenc-dual.dts
 dtc -@ -I dts -O dtb /tmp/rkvenc-dual.dts -o /tmp/rkvenc-dual.dtbo
 ```

@@ -25,7 +25,7 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
-#include <uapi/linux/rkvenc.h>
+#include "rkvenc.h"
 
 /* ---- Debug infrastructure ---- */
 extern unsigned int rkvenc_debug;

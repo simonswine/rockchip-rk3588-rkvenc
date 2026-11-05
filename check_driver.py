@@ -12,12 +12,11 @@ import shlex
 import subprocess
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[1]
-DRIVER = ROOT / "drivers/media/platform/rockchip/rkvenc"
-HEADER = (DRIVER / "rkvenc_hw.h").read_text()
-SERVICE = (DRIVER / "rkvenc_service.c").read_text()
-TASK = (DRIVER / "rkvenc_task.c").read_text()
-UAPI = (ROOT / "include/uapi/linux/rkvenc.h").read_text()
+ROOT = Path(__file__).resolve().parent
+HEADER = (ROOT / "rkvenc_hw.h").read_text()
+SERVICE = (ROOT / "rkvenc_service.c").read_text()
+TASK = (ROOT / "rkvenc_task.c").read_text()
+UAPI = (ROOT / "rkvenc.h").read_text()
 
 
 def declaration(source, kind, name):
