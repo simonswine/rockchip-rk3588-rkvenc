@@ -94,7 +94,8 @@ extern unsigned int rkvenc_debug;
 #define MPP_MAX_TASK_CAPACITY		16
 #define MPP_MAX_MSG_NUM			32
 #define MPP_MAX_REG_TRANS_NUM		128
-#define MPP_WORK_TIMEOUT_DELAY		200
+/* Above the largest hardware watchdog threshold (800 ms). */
+#define MPP_WORK_TIMEOUT_DELAY		1000
 #define RKVENC_SESSION_MAX_BUFFERS	40
 #define RKVENC_MAX_CORE_NUM		2
 #define RKVENC_MAX_DCHS_ID		4
@@ -465,6 +466,7 @@ struct rkvenc_mpp_task {
 	u32 task_id;
 	struct delayed_work timeout_work;
 	u32 irq_status;
+	int result;
 	u32 hw_cycles;
 	s64 hw_time;
 
@@ -585,6 +587,8 @@ struct rkvenc_task_msgs;
 
 /* ---- Session ---- */
 struct rkvenc_session {
+	struct kref ref;
+	struct mutex ioctl_lock;
 	int pid;
 	int index;
 
@@ -809,6 +813,7 @@ int rkvenc_service_probe(struct platform_device *pdev);
 int rkvenc_service_remove(struct platform_device *pdev);
 void rkvenc_task_worker_default(struct kthread_work *work);
 extern const struct file_operations rkvenc_fops;
+void rkvenc_session_put(struct rkvenc_session *session);
 
 /* rkvenc_iommu.c */
 struct rkvenc_iommu_info *rkvenc_iommu_probe(struct device *dev);
@@ -862,6 +867,7 @@ static inline int rkvenc_iommu_up_write(struct rkvenc_iommu_info *info)
 void rkvenc_free_task_callback(struct kref *ref);
 int rkvenc_task_init(struct rkvenc_session *session, struct rkvenc_mpp_task *task);
 int rkvenc_task_finish(struct rkvenc_session *session, struct rkvenc_mpp_task *task);
+void rkvenc_task_complete(struct rkvenc_mpp_task *task, int result);
 int rkvenc_task_finalize(struct rkvenc_session *session, struct rkvenc_mpp_task *task);
 int rkvenc_translate_reg_address(struct rkvenc_session *session,
 				  struct rkvenc_mpp_task *task, int fmt, u32 reg_class,

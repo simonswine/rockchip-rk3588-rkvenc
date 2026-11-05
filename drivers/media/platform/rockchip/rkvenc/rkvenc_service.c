@@ -42,6 +42,8 @@ static struct rkvenc_session *rkvenc_session_init(void)
 	if (!session)
 		return NULL;
 
+	kref_init(&session->ref);
+	mutex_init(&session->ioctl_lock);
 	session->pid = current->pid;
 	mutex_init(&session->pending_lock);
 	INIT_LIST_HEAD(&session->pending_list);
@@ -53,10 +55,9 @@ static struct rkvenc_session *rkvenc_session_init(void)
 	return session;
 }
 
-static void rkvenc_session_deinit(struct rkvenc_session *session)
+static void rkvenc_session_destroy(struct kref *ref)
 {
-	if (!session)
-		return;
+	struct rkvenc_session *session = container_of(ref, struct rkvenc_session, ref);
 
 	{
 		int i;
@@ -72,6 +73,11 @@ static void rkvenc_session_deinit(struct rkvenc_session *session)
 	}
 
 	kfree(session);
+}
+
+void rkvenc_session_put(struct rkvenc_session *session)
+{
+	kref_put(&session->ref, rkvenc_session_destroy);
 }
 
 /* ---- Attach session to encoder device ---- */
@@ -514,6 +520,7 @@ static struct rkvenc_task *rkvenc_alloc_task(struct rkvenc_session *session,
 	atomic_set(&mpp_task->abort_request, 0);
 	mpp_task->task_index = atomic_inc_return(&mpp->task_index);
 	mpp_task->task_id = atomic_inc_return(&mpp->queue->task_id);
+	kref_get(&session->ref);
 	atomic_inc(&session->task_count);
 	atomic_inc(&mpp->task_count);
 
@@ -566,7 +573,7 @@ static int rkvenc_result(struct rkvenc_dev *mpp,
 }
 
 /* Replace main-core IOVAs with the selected core's DMA mappings. */
-static void rkvenc_place_task(struct rkvenc_task *task, int core_id)
+static int rkvenc_place_task(struct rkvenc_task *task, int core_id)
 {
 	struct rkvenc_mem_region *mr;
 
@@ -574,10 +581,13 @@ static void rkvenc_place_task(struct rkvenc_task *task, int core_id)
 		u32 *reg = task->reg[mr->reg_class].data;
 		struct rkvenc_dma_buffer *buffer = mr->core_hdl[core_id];
 
+		if (!buffer)
+			return -ENODEV;
 		reg[mr->reg_idx] = reg[mr->reg_idx] - mr->iova + buffer->iova;
 		if (task->bs_buf == mr->hdl)
 			task->bs_buf = buffer;
 	}
+	return 0;
 }
 
 /* ---- Task ISR bottom half (called from kthread worker) ---- */
@@ -592,8 +602,6 @@ void rkvenc_task_worker_default(struct kthread_work *work)
 	/* Process finished tasks (ISR bottom half) */
 	mpp_task = enc->cur_task;
 	if (mpp_task && test_bit(TASK_STATE_IRQ, &mpp_task->state)) {
-		enc->cur_task = NULL;
-
 		task = container_of(mpp_task, struct rkvenc_task, mpp_task);
 		session = mpp_task->session;
 
@@ -614,36 +622,38 @@ void rkvenc_task_worker_default(struct kthread_work *work)
 			atomic_inc(&enc->reset_request);
 
 		rkvenc_task_finish(session, mpp_task);
-
-		set_bit(enc->core_id, &queue->core_idle);
+		mpp_task = NULL;
 	}
 
 	/* Process timed-out tasks */
 	if (mpp_task && test_bit(TASK_STATE_TIMEOUT, &mpp_task->state)) {
-		enc->cur_task = NULL;
-
 		session = mpp_task->session;
 
 		rkvenc_err("task %d timeout, reset\n", mpp_task->task_index);
 		atomic_inc(&enc->reset_request);
 
+		mpp_task->result = -ETIMEDOUT;
 		rkvenc_task_finish(session, mpp_task);
-		set_bit(enc->core_id, &queue->core_idle);
 	}
 
-	/* Trigger pending tasks if core is idle */
-	{
+	/* Fill all idle cores; submission work can be coalesced. */
+	for (;;) {
 		struct rkvenc_mpp_task *pending_task = NULL;
 		unsigned long flags;
 		unsigned long core_idle;
+		unsigned long usable = 0;
 		s32 core_id;
+		int i;
 
+		mutex_lock(&queue->pending_lock);
 		spin_lock_irqsave(&queue->running_lock, flags);
-		core_idle = queue->core_idle;
+		for (i = 0; i < RKVENC_MAX_CORE_NUM; i++)
+			if (queue->cores[i] && !queue->cores[i]->disable)
+				__set_bit(i, &usable);
+		core_idle = queue->core_idle & usable;
 		core_id = find_first_bit(&core_idle, queue->core_id_max + 1);
 
 		if (core_id <= queue->core_id_max && queue->cores[core_id]) {
-			mutex_lock(&queue->pending_lock);
 			pending_task = list_first_entry_or_null(&queue->pending_list,
 								struct rkvenc_mpp_task,
 								queue_link);
@@ -653,9 +663,21 @@ void rkvenc_task_worker_default(struct kthread_work *work)
 				pending_task->mpp = queue->cores[core_id];
 				pending_task->core_id = core_id;
 			}
-			mutex_unlock(&queue->pending_lock);
+		} else if (!usable) {
+			pending_task = list_first_entry_or_null(&queue->pending_list,
+					struct rkvenc_mpp_task, queue_link);
+			if (pending_task)
+				list_del_init(&pending_task->queue_link);
 		}
 		spin_unlock_irqrestore(&queue->running_lock, flags);
+		mutex_unlock(&queue->pending_lock);
+
+		if (pending_task && !usable) {
+			rkvenc_task_complete(pending_task, -ENODEV);
+			continue;
+		}
+		if (!pending_task)
+			break;
 
 		if (pending_task) {
 			struct rkvenc_dev *target = pending_task->mpp;
@@ -664,23 +686,18 @@ void rkvenc_task_worker_default(struct kthread_work *work)
 								   mpp_task);
 			int run_ret;
 
-			rkvenc_place_task(enc_task, target->core_id);
-
-			/* Set RCB buffers if SRAM available */
-			rkvenc2_set_rcbbuf(target, pending_task->session, enc_task);
-
-			/* Run on hardware */
-			set_bit(TASK_STATE_RUNNING, &pending_task->state);
-			run_ret = rkvenc_hw_run(target, pending_task);
+			run_ret = rkvenc_place_task(enc_task, target->core_id);
+			if (!run_ret) {
+				rkvenc2_set_rcbbuf(target, pending_task->session, enc_task);
+				set_bit(TASK_STATE_RUNNING, &pending_task->state);
+				run_ret = rkvenc_hw_run(target, pending_task);
+			}
 			if (run_ret) {
 				dev_err(target->dev,
 					"hw_run failed: %d, failing task %d\n",
 					run_ret, pending_task->task_index);
-				set_bit(TASK_STATE_DONE, &pending_task->state);
 				set_bit(target->core_id, &queue->core_idle);
-				rkvenc_task_finish(pending_task->session,
-						  pending_task);
-				wake_up(&pending_task->wait);
+				rkvenc_task_complete(pending_task, run_ret);
 			}
 		}
 	}
@@ -903,11 +920,13 @@ static int rkvenc_wait_result(struct rkvenc_session *session,
 task_done_ret:
 		ret = wait_event_interruptible(task->wait,
 					       test_bit(TASK_STATE_DONE, &task->state));
-		if (ret == -ERESTARTSYS)
-			rkvenc_err("wait task break by signal\n");
+		if (ret)
+			return ret;
 
-		/* Copy results to userspace */
-		rkvenc_result(task->mpp, task);
+		/* Keep the pending reference on interrupted waits. */
+		ret = task->result;
+		if (!ret)
+			ret = rkvenc_result(task->mpp, task);
 
 		/* Pop from pending list */
 		mutex_lock(&session->pending_lock);
@@ -922,12 +941,12 @@ task_done_ret:
 	/* Slice split mode: wait for all slices */
 	do {
 		ret = wait_event_interruptible(task->wait,
-					       kfifo_out(&enc_task->slice_info,
-							 &slice_info, 1));
-		if (ret == -ERESTARTSYS) {
-			rkvenc_err("wait task break by signal in slice mode\n");
-			return 0;
-		}
+				!kfifo_is_empty(&enc_task->slice_info) ||
+				test_bit(TASK_STATE_DONE, &task->state));
+		if (ret)
+			return ret;
+		if (!kfifo_out(&enc_task->slice_info, &slice_info, 1))
+			goto task_done_ret;
 
 		enc_task->slice_rd_cnt++;
 
@@ -937,7 +956,7 @@ task_done_ret:
 }
 
 /* ---- Main ioctl handler ---- */
-static long rkvenc_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+static long rkvenc_dev_ioctl_locked(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct rkvenc_session *session = filp->private_data;
 	struct rkvenc_task_msgs msgs;
@@ -1006,6 +1025,20 @@ static long rkvenc_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long 
 	return ret;
 }
 
+static long rkvenc_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	struct rkvenc_session *session = filp->private_data;
+	long ret;
+
+	if (!session)
+		return -EINVAL;
+	if (mutex_lock_interruptible(&session->ioctl_lock))
+		return -ERESTARTSYS;
+	ret = rkvenc_dev_ioctl_locked(filp, cmd, arg);
+	mutex_unlock(&session->ioctl_lock);
+	return ret;
+}
+
 /* ---- File operations ---- */
 static int rkvenc_dev_open(struct inode *inode, struct file *filp)
 {
@@ -1021,7 +1054,7 @@ static int rkvenc_dev_open(struct inode *inode, struct file *filp)
 	session->srv = srv;
 
 	if (!srv->sub_devices[MPP_DEVICE_RKVENC]) {
-		rkvenc_session_deinit(session);
+		rkvenc_session_put(session);
 		return -ENODEV;
 	}
 
@@ -1069,7 +1102,8 @@ static int rkvenc_dev_release(struct inode *inode, struct file *filp)
 		mutex_unlock(&session->pending_lock);
 	}
 
-	rkvenc_session_deinit(session);
+	/* Tasks retain the session and its DMA caches after a close timeout. */
+	rkvenc_session_put(session);
 	filp->private_data = NULL;
 
 	return 0;
@@ -1128,7 +1162,7 @@ int rkvenc_service_probe(struct platform_device *pdev)
 		atomic_set(&queue->reset_request, 0);
 		atomic_set(&queue->detach_count, 0);
 		atomic_set(&queue->task_id, 0);
-		queue->core_idle = (unsigned long)-1;
+		queue->core_idle = 0;
 
 		/* Create kthread worker */
 		kthread_init_worker(&queue->worker);

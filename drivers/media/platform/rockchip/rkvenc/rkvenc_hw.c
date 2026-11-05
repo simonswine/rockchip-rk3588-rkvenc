@@ -210,7 +210,8 @@ static void rkvenc2_patch_dchs(struct rkvenc_dev *enc, struct rkvenc_task *task)
 
 	ccu = enc->ccu;
 	dchs = ccu->dchs;
-	core_num = ccu->core_num;
+	/* Core IDs need not be dense (e.g. only core 1 enabled). */
+	core_num = RKVENC_MAX_CORE_NUM;
 
 	spin_lock_irqsave(&ccu->lock_dchs, flags);
 
@@ -504,10 +505,18 @@ int rkvenc_hw_run(struct rkvenc_dev *enc, struct rkvenc_mpp_task *mpp_task)
 
 	rkvenc_debug_enter();
 
-	/* Power on encoder and its IOMMU */
-	if (enc->iommu_info && enc->iommu_info->pdev)
-		pm_runtime_get_sync(&enc->iommu_info->pdev->dev);
-	pm_runtime_get_sync(enc->dev);
+	/* Failed resumes must not lead to MMIO accesses or unbalanced puts. */
+	if (enc->iommu_info && enc->iommu_info->pdev) {
+		ret = pm_runtime_resume_and_get(&enc->iommu_info->pdev->dev);
+		if (ret < 0)
+			return ret;
+	}
+	ret = pm_runtime_resume_and_get(enc->dev);
+	if (ret < 0) {
+		if (enc->iommu_info && enc->iommu_info->pdev)
+			pm_runtime_put_sync(&enc->iommu_info->pdev->dev);
+		return ret;
+	}
 	pm_stay_awake(enc->dev);
 	rkvenc_hw_clk_on(enc);
 
@@ -589,6 +598,7 @@ int rkvenc_hw_run(struct rkvenc_dev *enc, struct rkvenc_mpp_task *mpp_task)
 	return 0;
 
 err_deactivate:
+	rkvenc2_update_dchs(enc, task);
 	rkvenc_iommu_dev_deactivate(enc->iommu_info, enc);
 err_unlock:
 	if (enc->reset_group)
@@ -685,9 +695,19 @@ int rkvenc_hw_reset(struct rkvenc_dev *enc)
 	/* safe reset first */
 	ret = rkvenc_soft_reset(enc);
 
-	/* cru reset as fallback */
+	/* Suspend the MMU before CRU reset, then restore its page-table base.
+	 * A put/get pair is insufficient when device links hold extra PM refs.
+	 */
 	if (ret && enc->rst_a && enc->rst_h && enc->rst_core) {
+		struct device *iommu_dev = &enc->iommu_info->pdev->dev;
+
 		rkvenc_err("soft reset timeout, use cru reset\n");
+		rkvenc_iommu_down_write(enc->iommu_info);
+		ret = pm_runtime_force_suspend(iommu_dev);
+		if (ret) {
+			rkvenc_iommu_up_write(enc->iommu_info);
+			goto reset_done;
+		}
 		rkvenc_safe_reset(enc->rst_a);
 		rkvenc_safe_reset(enc->rst_h);
 		rkvenc_safe_reset(enc->rst_core);
@@ -696,20 +716,16 @@ int rkvenc_hw_reset(struct rkvenc_dev *enc)
 		rkvenc_safe_unreset(enc->rst_h);
 		rkvenc_safe_unreset(enc->rst_core);
 
-		/*
-		 * CRU reset wipes the IOMMU registers (DTE, paging).
-		 * Force a suspend→resume cycle on the IOMMU device to
-		 * re-program them via rk_iommu_enable.
-		 */
-		if (enc->iommu_info && enc->iommu_info->pdev) {
-			struct device *iommu_dev = &enc->iommu_info->pdev->dev;
-
-			pm_runtime_put_sync(iommu_dev);
-			pm_runtime_get_sync(iommu_dev);
-		}
+		ret = pm_runtime_force_resume(iommu_dev);
+		rkvenc_iommu_up_write(enc->iommu_info);
 	}
 
-	set_bit(enc->core_id, &queue->core_idle);
+reset_done:
+	if (ret) {
+		dev_err(enc->dev, "reset failed: %d; disabling core\n", ret);
+		enc->disable = 1;
+		clear_bit(enc->core_id, &queue->core_idle);
+	}
 
 	if (ccu) {
 		spin_lock_irqsave(&ccu->lock_dchs, flags);
@@ -720,7 +736,7 @@ int rkvenc_hw_reset(struct rkvenc_dev *enc)
 
 	atomic_set(&enc->reset_request, 0);
 
-	return 0;
+	return ret;
 }
 
 /* ---- Clock on/off ---- */
@@ -841,8 +857,12 @@ int rkvenc_hw_probe(struct rkvenc_dev *enc, struct platform_device *pdev)
 	enc->io_base = res->start;
 
 	/* Clocks and resets */
-	rkvenc_hw_init_clocks(enc);
-	rkvenc_hw_init_resets(enc);
+	ret = rkvenc_hw_init_clocks(enc);
+	if (ret)
+		goto failed;
+	ret = rkvenc_hw_init_resets(enc);
+	if (ret)
+		goto failed;
 
 	/* Set HW info early so it's available for HW ID read */
 	enc->hw_info = &rkvenc_v2_hw_info;
@@ -851,8 +871,10 @@ int rkvenc_hw_probe(struct rkvenc_dev *enc, struct platform_device *pdev)
 	/* IOMMU */
 	enc->iommu_info = rkvenc_iommu_probe(dev);
 	if (IS_ERR(enc->iommu_info)) {
-		dev_err(dev, "failed to attach iommu\n");
+		ret = PTR_ERR(enc->iommu_info);
 		enc->iommu_info = NULL;
+		dev_err_probe(dev, ret, "failed to attach iommu\n");
+		goto failed;
 	}
 
 	/* Read hardware ID */

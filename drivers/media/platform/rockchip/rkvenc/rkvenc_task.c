@@ -66,23 +66,36 @@ void rkvenc_free_task_callback(struct kref *ref)
 	atomic_dec(&session->mpp->task_count);
 
 	kfree(enc_task);
+	rkvenc_session_put(session);
 }
 
 int rkvenc_task_finish(struct rkvenc_session *session,
 		       struct rkvenc_mpp_task *task)
 {
 	struct rkvenc_dev *mpp = rkvenc_get_task_used_device(task, session);
-	struct rkvenc_taskqueue *queue = mpp->queue;
+	int ret;
 
-	/* Read status registers back from HW */
-	rkvenc_hw_finish(mpp, task);
+	/* Stop both asynchronous users before publishing completion/freeing task. */
+	disable_irq(mpp->irq);
+	mpp->cur_task = NULL;
+	cancel_delayed_work_sync(&task->timeout_work);
+	rkvenc_iommu_dev_deactivate(mpp->iommu_info, mpp);
 
-	/* Handle reset if needed */
-	if (mpp->reset_group) {
+	ret = rkvenc_hw_finish(mpp, task);
+	if (!task->result)
+		task->result = ret;
+	if (task->irq_status & INT_STA_ERROR)
+		task->result = -EIO;
+
+	/* Every timed-out/error task must reset, even without a reset group. */
+	if (mpp->reset_group)
 		up_read(&mpp->reset_group->rw_sem);
-		if (atomic_read(&mpp->reset_request) > 0)
-			rkvenc_hw_reset(mpp);
+	if (atomic_read(&mpp->reset_request) > 0) {
+		ret = rkvenc_hw_reset(mpp);
+		if (ret)
+			task->result = ret;
 	}
+	enable_irq(mpp->irq);
 
 	/* Power off encoder and its IOMMU */
 	rkvenc_hw_clk_off(mpp);
@@ -92,23 +105,21 @@ int rkvenc_task_finish(struct rkvenc_session *session,
 	if (mpp->iommu_info && mpp->iommu_info->pdev)
 		pm_runtime_put_sync(&mpp->iommu_info->pdev->dev);
 
+	if (!mpp->disable)
+		set_bit(mpp->core_id, &mpp->queue->core_idle);
+	rkvenc_task_complete(task, task->result);
+	return 0;
+}
+
+/* Also used for pre-start failures: no HW/PM resources to finish there. */
+void rkvenc_task_complete(struct rkvenc_mpp_task *task, int result)
+{
+	task->result = result;
+	list_del_init(&task->queue_link);
 	set_bit(TASK_STATE_FINISH, &task->state);
 	set_bit(TASK_STATE_DONE, &task->state);
-
-	/* Wake up the GET thread */
 	wake_up(&task->wait);
-
-	/* Pop from running queue */
-	{
-		unsigned long flags;
-
-		spin_lock_irqsave(&queue->running_lock, flags);
-		list_del_init(&task->queue_link);
-		spin_unlock_irqrestore(&queue->running_lock, flags);
-		kref_put(&task->ref, rkvenc_free_task_callback);
-	}
-
-	return 0;
+	kref_put(&task->ref, rkvenc_free_task_callback);
 }
 
 int rkvenc_task_finalize(struct rkvenc_session *session,
@@ -185,7 +196,9 @@ rkvenc_task_attach_fd(struct rkvenc_mpp_task *task, int fd)
 				}
 				task->session->core_dma[i] = core_dma;
 			}
+			rkvenc_iommu_down_read(core->iommu_info);
 			buffer = rkvenc_dma_import_fd(core->iommu_info, core_dma, fd, 0);
+			rkvenc_iommu_up_read(core->iommu_info);
 			if (IS_ERR(buffer)) {
 				ret = PTR_ERR(buffer);
 				goto release_imports;
