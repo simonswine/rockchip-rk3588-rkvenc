@@ -11,10 +11,11 @@ Sources were extracted from
 https://github.com/rcawston/rockchip-rk3588-mainline-patches at revision
 `e13a311d8ee5e8ed92ec3d4a57c21f766c61d660`.
 
-The first commit imports only the encoder and its UAPI header. The second
-applies the DRAM RCB patch from the sibling `nixos-opi5` repository
-(`pkgs/rkvenc/dram-rcb.patch`, commit `6daab24`). The final commit makes it
-standalone and includes the single-core diagnostic overlay from `0eccdde`.
+The initial commits import the encoder and its UAPI header, apply the DRAM RCB
+patch from the sibling `nixos-opi5` repository (`pkgs/rkvenc/dram-rcb.patch`,
+commit `6daab24`), and make it standalone with the single-core diagnostic
+overlay from `0eccdde`. Subsequent commits address dual-core register layouts,
+DMA mappings, scratch storage, scheduling, and recovery.
 The upstream Rockchip IOMMU modification is intentionally not included.
 Original per-file copyright notices and SPDX license identifiers are retained.
 
@@ -52,9 +53,13 @@ confirmed root-cause fix. MPP may also configure hardware synchronization,
 so the overlay alone does not guarantee every userspace dual-core feature
 is disabled.
 
-RCB storage is a 1 MiB coherent DMA allocation backed entirely by DRAM. The
-upstream `sram_*` field names remain, but fixed IOVA reservations and SRAM
-mappings are removed. A successful probe logs `DRAM RCB DMA address`.
+Each core now has its own 1 MiB coherent DRAM RCB allocation and retains its
+own DMA/IOMMU domain. Buffer imports are pinned for every eligible core before
+submission returns; register IOVAs are rebased to the selected core at dispatch.
+Raw-IOVA submissions (`MPP_FLAGS_REG_FD_NO_TRANS`) stay on the session's main
+core because those addresses cannot be translated to another domain. The
+upstream `sram_*` field names remain; fixed IOVA reservations and SRAM mappings
+are removed. A successful probe logs `DRAM RCB DMA address` for each core.
 
 Use compatible Rockchip MPP userspace. Container tests require
 `/dev/mpp_service`, `/dev/dri`, and SoC identification from sysfs/device tree.
@@ -65,5 +70,42 @@ Validated HEVC settings were:
 ```
 
 Short 1080p30 H.264/HEVC encodes and software decode validation passed.
-Longer dual-core sessions were not reliable. Hot-unbinding or unloading with
-active sessions is not validated; reboot between faulted-state tests.
+These runtime results predate the dual-core fixes. The fixes have been
+cross-built against ARM64 Linux 7.3 with `W=1`, but have **not yet been validated
+on hardware**. Hot-unbinding with active sessions is unsupported; sysfs bind
+and unbind controls are suppressed. Reboot between faulted-state tests.
+
+## Regression checks and dual-core validation
+
+Run `make test` with Python 3 and a host C compiler (`CC` can override it).
+The checks compile actual register definitions and pure request helpers from
+the driver, covering handshake packing, interrupt masks, slice/resolution
+fields, inclusive register endpoints, alignment/overflow, and offset-array
+bounds. They do not exercise DMA, interrupts, runtime PM, or scheduling.
+
+For controlled dual-core testing, compile/apply
+`dts/rk3588-rkvenc-dual.dtso` **instead of** the default single-core overlay.
+For example, using the matching kernel source include directory:
+
+```sh
+cc -E -P -x assembler-with-cpp -nostdinc -undef \
+  -I/path/to/kernel/source/include dts/rk3588-rkvenc-dual.dtso \
+  -o /tmp/rkvenc-dual.dts
+dtc -@ -I dts -O dtb /tmp/rkvenc-dual.dts -o /tmp/rkvenc-dual.dtbo
+```
+
+After deploying the module and overlay and rebooting:
+
+1. Confirm both cores probe, each with a DRAM RCB allocation. IOVA numbers may
+   coincide across separate domains; that does not mean physical storage is shared.
+2. Repeat the known-good single-core H.264/HEVC encode and software-decode check.
+3. Test one pipelined stream, then concurrent independent streams, for longer
+   than the previously failing workload. Check decoded frame counts and errors.
+4. Check the kernel journal for either MMU's page faults, watchdog/bus errors,
+   failed resets, and lockdep/KASAN warnings if those options are available.
+5. Exercise interrupted polls, process termination with tasks outstanding, and
+   idle/resume cycles. Controlled timeout/reset fault injection still needs
+   hardware validation; do not assume successful encoding proves recovery.
+
+Keep the single-core overlay available as a boot-time rollback. No deployment
+or remote configuration changes are performed by the build or host tests.

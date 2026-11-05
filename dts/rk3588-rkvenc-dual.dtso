@@ -1,0 +1,12 @@
+/* Experimental dual-core variant. Compile/apply this instead of the
+ * single-core overlay, not alongside it. Reboot between faulted-state tests.
+ */
+#include "rk3588-rkvenc.dtso"
+
+&rkvenc1 {
+    status = "okay";
+};
+
+&rkvenc1_mmu {
+    status = "okay";
+};
