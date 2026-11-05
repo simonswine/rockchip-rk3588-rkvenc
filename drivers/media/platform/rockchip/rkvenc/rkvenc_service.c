@@ -42,6 +42,8 @@ static struct rkvenc_session *rkvenc_session_init(void)
 	if (!session)
 		return NULL;
 
+	/* Closed files may leave asynchronous tasks holding this session. */
+	__module_get(THIS_MODULE);
 	kref_init(&session->ref);
 	mutex_init(&session->ioctl_lock);
 	session->pid = current->pid;
@@ -73,6 +75,7 @@ static void rkvenc_session_destroy(struct kref *ref)
 	}
 
 	kfree(session);
+	module_put(THIS_MODULE);
 }
 
 void rkvenc_session_put(struct rkvenc_session *session)
@@ -84,7 +87,7 @@ void rkvenc_session_put(struct rkvenc_session *session)
 static int rkvenc_session_attach_device(struct rkvenc_session *session,
 					struct rkvenc_dev *mpp)
 {
-	session->dma = rkvenc_dma_session_create(mpp->dev,
+	session->dma = rkvenc_dma_session_create(mpp,
 						 mpp->session_max_buffers);
 	if (!session->dma) {
 		rkvenc_err("failed to create dma session\n");
@@ -129,6 +132,14 @@ static void rkvenc_free_class_msg(struct rkvenc_task *task)
 		task->reg[i].size = 0;
 		task->reg[i].valid = 0;
 	}
+}
+
+/* Validate before inclusive endpoint arithmetic or copying register data. */
+static bool rkvenc_valid_reg_request(const struct mpp_request *req)
+{
+	return req->size && IS_ALIGNED(req->offset, sizeof(u32)) &&
+		IS_ALIGNED(req->size, sizeof(u32)) &&
+		req->offset <= U32_MAX - (req->size - sizeof(u32));
 }
 
 /* ---- Check if request overlaps a class ---- */
@@ -203,9 +214,7 @@ static int rkvenc_extract_task_msg(struct rkvenc_session *session,
 
 		if ((req->cmd == MPP_CMD_SET_REG_WRITE ||
 		     req->cmd == MPP_CMD_SET_REG_READ) &&
-		    (!IS_ALIGNED(req->offset, sizeof(u32)) ||
-		     !IS_ALIGNED(req->size, sizeof(u32)) ||
-		     req->offset > U32_MAX - (req->size - sizeof(u32)))) {
+		    !rkvenc_valid_reg_request(req)) {
 			ret = -EINVAL;
 			goto fail;
 		}
@@ -1051,7 +1060,9 @@ static long rkvenc_dev_ioctl_locked(struct file *filp, unsigned int cmd, unsigne
 	if (msgs.set_cnt && session->mpp) {
 		struct rkvenc_taskqueue *queue = session->mpp->queue;
 
+		mutex_lock(&queue->dev_lock);
 		task = rkvenc_alloc_task(session, &msgs);
+		mutex_unlock(&queue->dev_lock);
 		if (!task) {
 			rkvenc_err("alloc task failed\n");
 			return -ENOMEM;
@@ -1172,6 +1183,7 @@ static int rkvenc_dev_release(struct inode *inode, struct file *filp)
 }
 
 const struct file_operations rkvenc_fops = {
+	.owner		= THIS_MODULE,
 	.open		= rkvenc_dev_open,
 	.release	= rkvenc_dev_release,
 	.unlocked_ioctl = rkvenc_dev_ioctl,
@@ -1201,6 +1213,8 @@ int rkvenc_service_probe(struct platform_device *pdev)
 	/* Read DTS properties */
 	of_property_read_u32(dev->of_node, "rockchip,taskqueue-count", &taskqueue_cnt);
 	of_property_read_u32(dev->of_node, "rockchip,resetgroup-count", &resetgroup_cnt);
+	if (resetgroup_cnt > ARRAY_SIZE(srv->reset_groups))
+		return -EINVAL;
 	srv->taskqueue_cnt = taskqueue_cnt;
 	srv->reset_group_cnt = resetgroup_cnt;
 
@@ -1228,14 +1242,6 @@ int rkvenc_service_probe(struct platform_device *pdev)
 
 		/* Create kthread worker */
 		kthread_init_worker(&queue->worker);
-		queue->kworker_task = kthread_run(kthread_worker_fn,
-						  &queue->worker,
-						  "rkvenc-worker");
-		if (IS_ERR(queue->kworker_task)) {
-			dev_err(dev, "failed to create kthread worker\n");
-			return PTR_ERR(queue->kworker_task);
-		}
-
 		srv->task_queues[MPP_DEVICE_RKVENC] = queue;
 	}
 
@@ -1283,6 +1289,18 @@ int rkvenc_service_probe(struct platform_device *pdev)
 		goto err_device;
 	}
 
+	/* Start only after all fallible allocations, so probe failure leaks no thread. */
+	{
+		struct rkvenc_taskqueue *queue = srv->task_queues[MPP_DEVICE_RKVENC];
+
+		queue->kworker_task = kthread_run(kthread_worker_fn, &queue->worker,
+						  "rkvenc-worker");
+		if (IS_ERR(queue->kworker_task)) {
+			ret = PTR_ERR(queue->kworker_task);
+			device_destroy(srv->cls, srv->dev_id);
+			goto err_device;
+		}
+	}
 	platform_set_drvdata(pdev, srv);
 	dev_info(dev, "mpp_service probe success\n");
 

@@ -77,8 +77,15 @@ static int rkvenc_attach_ccu(struct device *dev, struct rkvenc_dev *enc)
 		return -ENODEV;
 
 	ccu = platform_get_drvdata(pdev);
-	if (!ccu)
+	if (!ccu) {
+		platform_device_put(pdev);
 		return -EPROBE_DEFER;
+	}
+	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+		platform_device_put(pdev);
+		return -ENOMEM;
+	}
+	platform_device_put(pdev);
 
 	INIT_LIST_HEAD(&enc->core_link);
 	mutex_lock(&ccu->lock);
@@ -86,17 +93,8 @@ static int rkvenc_attach_ccu(struct device *dev, struct rkvenc_dev *enc)
 	list_add_tail(&enc->core_link, &ccu->core_list);
 	mutex_unlock(&ccu->lock);
 
-	/* Keep each core in its DMA API domain; imports follow task placement. */
-	if (!ccu->main_core)
-		ccu->main_core = enc;
+	/* Publish the main core only after all probe steps have succeeded. */
 	enc->ccu = ccu;
-
-	dev_info(dev, "attach ccu as core %d%s\n", enc->core_id,
-		 enc == ccu->main_core ? " [main]" :
-		 (enc->queue && enc->core_id >= 0 &&
-		  enc->core_id < MPP_MAX_CORE_NUM &&
-		  enc->queue->cores[enc->core_id] == enc ?
-		  " [secondary, active]" : " [secondary, inactive]"));
 	return 0;
 }
 
@@ -120,8 +118,15 @@ static int rkvenc_attach_service(struct rkvenc_dev *enc)
 		return -ENODEV;
 
 	srv = platform_get_drvdata(pdev);
-	if (!srv)
+	if (!srv) {
+		platform_device_put(pdev);
 		return -EPROBE_DEFER;
+	}
+	if (!device_link_add(enc->dev, &pdev->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+		platform_device_put(pdev);
+		return -ENOMEM;
+	}
+	platform_device_put(pdev);
 
 	enc->srv = srv;
 
@@ -135,15 +140,6 @@ static int rkvenc_attach_service(struct rkvenc_dev *enc)
 		return -ENODEV;
 	}
 	enc->queue = queue;
-
-	/* Register core in the task queue */
-	if (enc->core_id >= 0 && enc->core_id < MPP_MAX_CORE_NUM) {
-		queue->cores[enc->core_id] = enc;
-		queue->core_count++;
-		if (enc->core_id > queue->core_id_max)
-			queue->core_id_max = enc->core_id;
-		set_bit(enc->core_id, &queue->core_idle);
-	}
 
 	/* Attach to reset group */
 	if (resetgroup_node < srv->reset_group_cnt)
@@ -243,11 +239,33 @@ static int rkvenc_core_probe(struct platform_device *pdev)
 		goto err_hw;
 	}
 
-	/* If this is the main core, register with the service */
-	if (enc->ccu && enc == enc->ccu->main_core) {
+	/* A failed/deferred probe must never leave a schedulable core behind. */
+	mutex_lock(&enc->queue->dev_lock);
+	if (enc->queue->cores[enc->core_id]) {
+		mutex_unlock(&enc->queue->dev_lock);
+		ret = -EBUSY;
+		goto err_hw;
+	}
+	mutex_lock(&enc->ccu->lock);
+	if (!enc->ccu->main_core)
+		enc->ccu->main_core = enc;
+	mutex_unlock(&enc->ccu->lock);
+	spin_lock_irq(&enc->queue->running_lock);
+	enc->queue->cores[enc->core_id] = enc;
+	enc->queue->core_count++;
+	enc->queue->core_id_max = max_t(u32, enc->queue->core_id_max, enc->core_id);
+	set_bit(enc->core_id, &enc->queue->core_idle);
+	spin_unlock_irq(&enc->queue->running_lock);
+	mutex_lock(&enc->srv->session_lock);
+	if (enc == enc->ccu->main_core) {
 		enc->srv->sub_devices[MPP_DEVICE_RKVENC] = enc;
 		set_bit(MPP_DEVICE_RKVENC, &enc->srv->hw_support);
 	}
+	mutex_unlock(&enc->srv->session_lock);
+	mutex_unlock(&enc->queue->dev_lock);
+
+	dev_info(dev, "attach ccu as core %d [%s]\n", enc->core_id,
+		 enc == enc->ccu->main_core ? "main" : "secondary, active");
 
 	dev_info(dev, "rkvenc core %d probe success (hw_id: %08x)\n",
 		 enc->core_id, enc->hw_info->hw.hw_id);
@@ -275,10 +293,26 @@ static int rkvenc_core_remove(struct platform_device *pdev)
 	if (!enc)
 		return 0;
 
+	mutex_lock(&enc->queue->dev_lock);
+	spin_lock_irq(&enc->queue->running_lock);
+	enc->queue->cores[enc->core_id] = NULL;
+	clear_bit(enc->core_id, &enc->queue->core_idle);
+	enc->queue->core_count--;
+	spin_unlock_irq(&enc->queue->running_lock);
+	mutex_lock(&enc->srv->session_lock);
+	if (enc->srv->sub_devices[MPP_DEVICE_RKVENC] == enc) {
+		enc->srv->sub_devices[MPP_DEVICE_RKVENC] = NULL;
+		clear_bit(MPP_DEVICE_RKVENC, &enc->srv->hw_support);
+	}
+	mutex_unlock(&enc->srv->session_lock);
+	mutex_unlock(&enc->queue->dev_lock);
+
 	if (enc->ccu) {
 		mutex_lock(&enc->ccu->lock);
 		list_del_init(&enc->core_link);
 		enc->ccu->core_num--;
+		if (enc->ccu->main_core == enc)
+			enc->ccu->main_core = NULL;
 		mutex_unlock(&enc->ccu->lock);
 	}
 
@@ -365,6 +399,8 @@ static struct platform_driver rkvenc_driver = {
 		.name = MPP_DRIVER_NAME,
 		.of_match_table = rkvenc_dt_match,
 		.pm = &rkvenc_pm_ops,
+		/* Active-session unbind is not supported. */
+		.suppress_bind_attrs = true,
 	},
 };
 

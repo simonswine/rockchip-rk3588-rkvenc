@@ -188,7 +188,7 @@ rkvenc_task_attach_fd(struct rkvenc_mpp_task *task, int fd)
 				continue;
 			core_dma = task->session->core_dma[i];
 			if (!core_dma) {
-				core_dma = rkvenc_dma_session_create(core->dev,
+				core_dma = rkvenc_dma_session_create(core,
 								   core->session_max_buffers);
 				if (!core_dma) {
 					ret = -ENOMEM;
@@ -206,6 +206,14 @@ rkvenc_task_attach_fd(struct rkvenc_mpp_task *task, int fd)
 			mem_region->core_hdl[i] = buffer;
 		}
 		buffer = mem_region->core_hdl[mpp->core_id];
+		for (i = 0; i < RKVENC_MAX_CORE_NUM; i++) {
+			struct rkvenc_dma_buffer *other = mem_region->core_hdl[i];
+
+			if (other && other->dmabuf != buffer->dmabuf) {
+				ret = -EINVAL;
+				goto release_imports;
+			}
+		}
 		mem_region->hdl = buffer;
 		mem_region->iova = buffer->iova;
 		mem_region->len = buffer->size;

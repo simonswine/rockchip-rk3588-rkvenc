@@ -520,7 +520,9 @@ int rkvenc_hw_run(struct rkvenc_dev *enc, struct rkvenc_mpp_task *mpp_task)
 		return ret;
 	}
 	pm_stay_awake(enc->dev);
-	rkvenc_hw_clk_on(enc);
+	ret = rkvenc_hw_clk_on(enc);
+	if (ret)
+		goto err_pm;
 
 	/* Reset group down_read if available */
 	if (enc->reset_group)
@@ -606,6 +608,7 @@ err_unlock:
 	if (enc->reset_group)
 		up_read(&enc->reset_group->rw_sem);
 	rkvenc_hw_clk_off(enc);
+err_pm:
 	pm_relax(enc->dev);
 	pm_runtime_mark_last_busy(enc->dev);
 	pm_runtime_put_autosuspend(enc->dev);
@@ -742,11 +745,23 @@ reset_done:
 }
 
 /* ---- Clock on/off ---- */
-void rkvenc_hw_clk_on(struct rkvenc_dev *enc)
+int rkvenc_hw_clk_on(struct rkvenc_dev *enc)
 {
-	rkvenc_clk_safe_enable(enc->aclk_info.clk);
-	rkvenc_clk_safe_enable(enc->hclk_info.clk);
-	rkvenc_clk_safe_enable(enc->core_clk_info.clk);
+	int ret;
+
+	ret = clk_prepare_enable(enc->aclk_info.clk);
+	if (ret)
+		return ret;
+	ret = clk_prepare_enable(enc->hclk_info.clk);
+	if (ret)
+		goto disable_aclk;
+	ret = clk_prepare_enable(enc->core_clk_info.clk);
+	if (!ret)
+		return 0;
+	clk_disable_unprepare(enc->hclk_info.clk);
+disable_aclk:
+	clk_disable_unprepare(enc->aclk_info.clk);
+	return ret;
 }
 
 void rkvenc_hw_clk_off(struct rkvenc_dev *enc)
@@ -759,29 +774,19 @@ void rkvenc_hw_clk_off(struct rkvenc_dev *enc)
 /* ---- HW init during probe ---- */
 static int rkvenc_hw_init_clocks(struct rkvenc_dev *enc)
 {
-	int ret;
 	struct device *dev = enc->dev;
 
 	enc->aclk_info.clk = devm_clk_get(dev, "aclk_vcodec");
-	if (IS_ERR(enc->aclk_info.clk)) {
-		ret = PTR_ERR(enc->aclk_info.clk);
-		enc->aclk_info.clk = NULL;
-		dev_err(dev, "failed to get aclk_vcodec: %d\n", ret);
-	}
+	if (IS_ERR(enc->aclk_info.clk))
+		return dev_err_probe(dev, PTR_ERR(enc->aclk_info.clk), "aclk_vcodec\n");
 
 	enc->hclk_info.clk = devm_clk_get(dev, "hclk_vcodec");
-	if (IS_ERR(enc->hclk_info.clk)) {
-		ret = PTR_ERR(enc->hclk_info.clk);
-		enc->hclk_info.clk = NULL;
-		dev_err(dev, "failed to get hclk_vcodec: %d\n", ret);
-	}
+	if (IS_ERR(enc->hclk_info.clk))
+		return dev_err_probe(dev, PTR_ERR(enc->hclk_info.clk), "hclk_vcodec\n");
 
 	enc->core_clk_info.clk = devm_clk_get(dev, "clk_core");
-	if (IS_ERR(enc->core_clk_info.clk)) {
-		ret = PTR_ERR(enc->core_clk_info.clk);
-		enc->core_clk_info.clk = NULL;
-		dev_err(dev, "failed to get clk_core: %d\n", ret);
-	}
+	if (IS_ERR(enc->core_clk_info.clk))
+		return dev_err_probe(dev, PTR_ERR(enc->core_clk_info.clk), "clk_core\n");
 
 	/* Set default rates */
 	enc->aclk_info.default_rate_hz = 300000000;
@@ -795,22 +800,16 @@ static int rkvenc_hw_init_resets(struct rkvenc_dev *enc)
 	struct device *dev = enc->dev;
 
 	enc->rst_a = devm_reset_control_get_optional(dev, "video_a");
-	if (IS_ERR(enc->rst_a)) {
-		enc->rst_a = NULL;
-		dev_warn(dev, "no video_a reset\n");
-	}
+	if (IS_ERR(enc->rst_a))
+		return dev_err_probe(dev, PTR_ERR(enc->rst_a), "video_a reset\n");
 
 	enc->rst_h = devm_reset_control_get_optional(dev, "video_h");
-	if (IS_ERR(enc->rst_h)) {
-		enc->rst_h = NULL;
-		dev_warn(dev, "no video_h reset\n");
-	}
+	if (IS_ERR(enc->rst_h))
+		return dev_err_probe(dev, PTR_ERR(enc->rst_h), "video_h reset\n");
 
 	enc->rst_core = devm_reset_control_get_optional(dev, "video_core");
-	if (IS_ERR(enc->rst_core)) {
-		enc->rst_core = NULL;
-		dev_warn(dev, "no video_core reset\n");
-	}
+	if (IS_ERR(enc->rst_core))
+		return dev_err_probe(dev, PTR_ERR(enc->rst_core), "video_core reset\n");
 
 	return 0;
 }
@@ -879,13 +878,19 @@ int rkvenc_hw_probe(struct rkvenc_dev *enc, struct platform_device *pdev)
 		goto failed;
 	}
 
-	/* Read hardware ID */
-	pm_runtime_get_sync(dev);
-	rkvenc_hw_clk_on(enc);
-	rkvenc_v2_hw_info.hw.hw_id = rkvenc_read(enc,
+	/* Read hardware ID only after a successful power/clock transition. */
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		goto failed_iommu;
+	ret = rkvenc_hw_clk_on(enc);
+	if (!ret) {
+		rkvenc_v2_hw_info.hw.hw_id = rkvenc_read(enc,
 					rkvenc_v2_hw_info.hw.reg_id * sizeof(u32));
-	rkvenc_hw_clk_off(enc);
+		rkvenc_hw_clk_off(enc);
+	}
 	pm_runtime_put_sync(dev);
+	if (ret)
+		goto failed_iommu;
 
 	/* Init state */
 	atomic_set(&enc->reset_request, 0);
@@ -897,6 +902,8 @@ int rkvenc_hw_probe(struct rkvenc_dev *enc, struct platform_device *pdev)
 
 	return 0;
 
+failed_iommu:
+	rkvenc_iommu_remove(enc->iommu_info);
 failed:
 	device_init_wakeup(dev, false);
 	pm_runtime_disable(dev);

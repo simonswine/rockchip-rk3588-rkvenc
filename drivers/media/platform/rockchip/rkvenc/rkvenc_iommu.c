@@ -99,9 +99,11 @@ static int rkvenc_dma_remove_extra_buffer(struct rkvenc_dma_session *dma)
 int rkvenc_dma_release(struct rkvenc_dma_session *dma,
 		       struct rkvenc_dma_buffer *buffer)
 {
+	rkvenc_iommu_down_read(dma->iommu_info);
 	mutex_lock(&dma->list_mutex);
 	kref_put(&buffer->ref, rkvenc_dma_release_buffer);
 	mutex_unlock(&dma->list_mutex);
+	rkvenc_iommu_up_read(dma->iommu_info);
 
 	return 0;
 }
@@ -286,19 +288,30 @@ int rkvenc_dma_session_destroy(struct rkvenc_dma_session *dma)
 	if (!dma)
 		return -EINVAL;
 
+	rkvenc_iommu_down_read(dma->iommu_info);
 	mutex_lock(&dma->list_mutex);
-	list_for_each_entry_safe(buffer, n, &dma->used_list, link)
-		kref_put(&buffer->ref, rkvenc_dma_release_buffer);
-	list_for_each_entry_safe(buffer, n, &dma->static_list, link)
-		kref_put(&buffer->ref, rkvenc_dma_release_buffer);
+	/* No task/file references remain: drop every cached/static import pin. */
+	list_for_each_entry_safe(buffer, n, &dma->used_list, link) {
+		unsigned int refs = kref_read(&buffer->ref);
+
+		while (refs--)
+			kref_put(&buffer->ref, rkvenc_dma_release_buffer);
+	}
+	list_for_each_entry_safe(buffer, n, &dma->static_list, link) {
+		unsigned int refs = kref_read(&buffer->ref);
+
+		while (refs--)
+			kref_put(&buffer->ref, rkvenc_dma_release_buffer);
+	}
 	mutex_unlock(&dma->list_mutex);
+	rkvenc_iommu_up_read(dma->iommu_info);
 
 	kfree(dma);
 	return 0;
 }
 
 struct rkvenc_dma_session *
-rkvenc_dma_session_create(struct device *dev, u32 max_buffers)
+rkvenc_dma_session_create(struct rkvenc_dev *mpp, u32 max_buffers)
 {
 	int i;
 	struct rkvenc_dma_session *dma;
@@ -324,7 +337,8 @@ rkvenc_dma_session_create(struct device *dev, u32 max_buffers)
 		INIT_LIST_HEAD(&buffer->link);
 		list_add_tail(&buffer->link, &dma->unused_list);
 	}
-	dma->dev = dev;
+	dma->dev = mpp->dev;
+	dma->iommu_info = mpp->iommu_info;
 
 	return dma;
 }

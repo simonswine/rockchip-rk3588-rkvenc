@@ -352,6 +352,7 @@ struct rkvenc_dma_buffer {
 };
 
 struct rkvenc_dma_session {
+	struct rkvenc_iommu_info *iommu_info;
 	struct list_head unused_list;
 	struct list_head used_list;
 	struct list_head static_list;
@@ -831,7 +832,7 @@ int rkvenc_iommu_flush_tlb(struct rkvenc_iommu_info *info);
 int rkvenc_iommu_dev_activate(struct rkvenc_iommu_info *info, struct rkvenc_dev *dev);
 int rkvenc_iommu_dev_deactivate(struct rkvenc_iommu_info *info, struct rkvenc_dev *dev);
 
-struct rkvenc_dma_session *rkvenc_dma_session_create(struct device *dev, u32 max_buffers);
+struct rkvenc_dma_session *rkvenc_dma_session_create(struct rkvenc_dev *mpp, u32 max_buffers);
 int rkvenc_dma_session_destroy(struct rkvenc_dma_session *dma);
 struct rkvenc_dma_buffer *rkvenc_dma_import_fd(struct rkvenc_iommu_info *iommu_info,
 					       struct rkvenc_dma_session *dma,
@@ -891,7 +892,7 @@ irqreturn_t rkvenc_hw_irq(int irq, void *param);
 int rkvenc_hw_run(struct rkvenc_dev *mpp, struct rkvenc_mpp_task *mpp_task);
 int rkvenc_hw_finish(struct rkvenc_dev *mpp, struct rkvenc_mpp_task *mpp_task);
 int rkvenc_hw_reset(struct rkvenc_dev *enc);
-void rkvenc_hw_clk_on(struct rkvenc_dev *enc);
+int rkvenc_hw_clk_on(struct rkvenc_dev *enc);
 void rkvenc_hw_clk_off(struct rkvenc_dev *enc);
 
 /* HW info for VEPU580 */
