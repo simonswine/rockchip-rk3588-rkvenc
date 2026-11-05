@@ -326,9 +326,9 @@ static void rkvenc2_calc_timeout_thd(struct rkvenc_dev *enc)
 		}
 	}
 
-	/* Use x1024 core clk cycles for VEPU580 */
+	/* Sub-module watchdogs use one quarter of the frame threshold. */
 	if (enc->core_clk_info.clk)
-		timeout_thd |= timeout_ms * clk_get_rate(enc->core_clk_info.clk) / 1024000;
+		timeout_thd |= timeout_ms * (clk_get_rate(enc->core_clk_info.clk) / 256000);
 
 	rkvenc_write(enc, RKVENC_WDG, timeout_thd);
 }
@@ -391,7 +391,7 @@ static void rkvenc2_bs_overflow_handle(struct rkvenc_dev *mpp)
 	bs_wr += 128;
 	if (bs_wr >= bs_top)
 		bs_wr = bs_bot;
-	rkvenc_write(mpp, RKVENC2_REG_ADR_BSBS, bs_wr);
+	rkvenc_write(mpp, RKVENC580_REG_ADR_BSBS, bs_wr);
 
 	if (mpp_task)
 		dev_err(mpp->dev, "task %d bitstream overflow [top=%#08x bot=%#08x wr=%#08x rd=%#08x]\n",

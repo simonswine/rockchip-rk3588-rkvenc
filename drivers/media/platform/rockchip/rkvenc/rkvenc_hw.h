@@ -97,7 +97,7 @@ extern unsigned int rkvenc_debug;
 #define MPP_WORK_TIMEOUT_DELAY		200
 #define RKVENC_SESSION_MAX_BUFFERS	40
 #define RKVENC_MAX_CORE_NUM		2
-#define RKVENC_MAX_DCHS_ID		16
+#define RKVENC_MAX_DCHS_ID		4
 
 /* ---- Device types (must match MPP userspace MppClientType enum) ---- */
 enum MPP_DEVICE_TYPE {
@@ -180,13 +180,14 @@ enum RKVENC_VEPU_TYPE {
 #define RKVENC2_REG_ADR_BSBR		0x02bc
 
 #define RKVENC580_REG_ADR_BSBR		0x02b8
+#define RKVENC580_REG_ADR_BSBS		0x02bc
 
 #define RKVENC2_REG_ST_BSB		0x402c
 
 #define RKVENC2_REG_SLICE_NUM_BASE	0x4034
 #define RKVENC2_REG_SLICE_LEN_BASE	0x4038
 
-#define DCHS_REG_OFFSET			0x0084
+#define DCHS_REG_OFFSET			0x0304
 
 #define RKVENC2_BIT_ENC_STND		BIT(0)
 #define RKVENC2_BIT_SLEN_FIFO		BIT(30)
@@ -196,17 +197,22 @@ enum RKVENC_VEPU_TYPE {
 #define RKVENC2_BIT_VAL_H264		0
 #define RKVENC2_BIT_VAL_H265		1
 
-#define RKVENC_SCLR_DONE_STA		BIT(4)
+#define RKVENC_SCLR_DONE_STA		BIT(2)
 
-/* Interrupt status bits */
+/* VEPU580 interrupt status bits (not register indices). */
 #define INT_STA_ENC_DONE_STA		BIT(0)
-#define INT_STA_SLC_DONE_STA		BIT(1)
-#define INT_STA_BSF_OFLW_STA		BIT(2)
-#define INT_STA_WDG_STA			BIT(5)
-#define INT_STA_ERROR			(0x03f0)
+#define INT_STA_SLC_DONE_STA		BIT(3)
+#define INT_STA_BSF_OFLW_STA		BIT(4)
+#define INT_STA_BRSP_OTSD_STA		BIT(5)
+#define INT_STA_WBUS_ERR_STA		BIT(6)
+#define INT_STA_RBUS_ERR_STA		BIT(7)
+#define INT_STA_WDG_STA			BIT(8)
+#define INT_STA_ERROR			(INT_STA_BRSP_OTSD_STA | \
+					 INT_STA_WBUS_ERR_STA | \
+					 INT_STA_RBUS_ERR_STA | INT_STA_WDG_STA)
 
 /* Dual-core handshake */
-#define DCHS_TXE			BIT(8)
+#define DCHS_TXE			BIT(4)
 
 /* ---- Clock mode ---- */
 enum MPP_CLOCK_MODE {
@@ -488,37 +494,35 @@ struct rkvenc_class_msg {
 union rkvenc2_dual_core_handshake_id {
 	u64 val[2];
 	struct {
-		/* val[0] */
+		/* val[0]: low dword is the VEPU580 register at 0x304. */
+		u32 txid	: 2;
+		u32 rxid	: 2;
 		u32 txe		: 1;
-		u32 reserved0	: 3;
-		u32 txid	: 4;
 		u32 rxe		: 1;
-		u32 reserved1	: 3;
-		u32 rxid	: 4;
-		u32 reserved2	: 16;
+		u32 reserved0	: 2;
+		u32 dly		: 8;
+		u32 offset	: 11;
+		u32 reserved1	: 5;
 		u32 session_id;
-		/* val[1] */
+		/* val[1]: software bookkeeping only. */
+		u32 working	: 1;
 		u32 txe_orig	: 1;
-		u32 reserved3	: 3;
-		u32 txid_orig	: 4;
 		u32 rxe_orig	: 1;
-		u32 reserved4	: 3;
-		u32 rxid_orig	: 4;
+		u32 txid_orig	: 2;
+		u32 rxid_orig	: 2;
 		u32 txe_map	: 1;
-		u32 reserved5	: 3;
-		u32 txid_map	: 4;
 		u32 rxe_map	: 1;
-		u32 reserved6	: 3;
-		u32 rxid_map	: 4;
-		u32 working;
+		u32 txid_map	: 2;
+		u32 rxid_map	: 2;
+		u32 reserved2	: 19;
+		u32 reserved3;
 	};
 };
 
 union rkvenc2_slice_len_info {
 	u32 val;
 	struct {
-		u32 slice_len	: 24;
-		u32 reserved	: 7;
+		u32 slice_len	: 31;
 		u32 last	: 1;
 	};
 };
@@ -526,10 +530,10 @@ union rkvenc2_slice_len_info {
 union rkvenc2_frame_resolution {
 	u32 val;
 	struct {
-		u32 pic_wd8	: 13;
-		u32 reserved0	: 3;
-		u32 pic_hd8	: 13;
-		u32 reserved1	: 3;
+		u32 pic_wd8	: 11;
+		u32 reserved0	: 5;
+		u32 pic_hd8	: 11;
+		u32 reserved1	: 5;
 	};
 };
 
