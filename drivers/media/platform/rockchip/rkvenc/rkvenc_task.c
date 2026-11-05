@@ -38,7 +38,6 @@ void rkvenc_free_task_callback(struct kref *ref)
 {
 	struct rkvenc_mpp_task *task = container_of(ref, struct rkvenc_mpp_task, ref);
 	struct rkvenc_session *session;
-	struct rkvenc_dev *mpp;
 	struct rkvenc_task *enc_task = container_of(task, struct rkvenc_task, mpp_task);
 
 	if (!task->session) {
@@ -46,7 +45,6 @@ void rkvenc_free_task_callback(struct kref *ref)
 		return;
 	}
 	session = task->session;
-	mpp = rkvenc_get_task_used_device(task, session);
 
 	/* Release memory regions and free class register buffers */
 	rkvenc_task_finalize(session, task);
@@ -64,7 +62,8 @@ void rkvenc_free_task_callback(struct kref *ref)
 	}
 
 	atomic_dec(&session->task_count);
-	atomic_dec(&mpp->task_count);
+	/* Submission accounting belongs to the session's main device. */
+	atomic_dec(&session->mpp->task_count);
 
 	kfree(enc_task);
 }
@@ -116,13 +115,17 @@ int rkvenc_task_finalize(struct rkvenc_session *session,
 			 struct rkvenc_mpp_task *task)
 {
 	struct rkvenc_mem_region *mem_region = NULL, *n;
-	struct rkvenc_dev *mpp = rkvenc_get_task_used_device(task, session);
 
 	list_for_each_entry_safe(mem_region, n, &task->mem_region_list, reg_link) {
 		if (!mem_region->is_dup) {
-			rkvenc_iommu_down_read(mpp->iommu_info);
-			rkvenc_dma_release(session->dma, mem_region->hdl);
-			rkvenc_iommu_up_read(mpp->iommu_info);
+			int i;
+
+			for (i = 0; i < RKVENC_MAX_CORE_NUM; i++) {
+				struct rkvenc_dma_buffer *buf = mem_region->core_hdl[i];
+
+				if (buf)
+					rkvenc_dma_release(buf->dma, buf);
+			}
 		}
 		list_del_init(&mem_region->reg_link);
 	}
@@ -144,7 +147,7 @@ rkvenc_task_attach_fd(struct rkvenc_mpp_task *task, int fd)
 	if (fd <= 0 || !dma || !mpp)
 		return ERR_PTR(-EINVAL);
 
-	if (task->mem_count > mem_num) {
+	if (task->mem_count >= mem_num) {
 		rkvenc_err("mem_count %d must less than %d\n", task->mem_count, mem_num);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -163,21 +166,51 @@ rkvenc_task_attach_fd(struct rkvenc_mpp_task *task, int fd)
 		mem_region->reg_class = 0;
 		mem_region->is_dup = true;
 	} else {
-		rkvenc_iommu_down_read(mpp->iommu_info);
-		buffer = rkvenc_dma_import_fd(mpp->iommu_info, dma, fd, 0);
-		rkvenc_iommu_up_read(mpp->iommu_info);
-		if (IS_ERR(buffer)) {
-			rkvenc_err("can't import dma-buf %d\n", fd);
-			return ERR_CAST(buffer);
-		}
+		int i, ret;
 
+		/* Pin mappings now: userspace may close/reuse fd after submission. */
+		for (i = 0; i < RKVENC_MAX_CORE_NUM; i++) {
+			struct rkvenc_dev *core = mpp->queue->cores[i];
+			struct rkvenc_dma_session *core_dma;
+
+			if (!core)
+				continue;
+			core_dma = task->session->core_dma[i];
+			if (!core_dma) {
+				core_dma = rkvenc_dma_session_create(core->dev,
+								   core->session_max_buffers);
+				if (!core_dma) {
+					ret = -ENOMEM;
+					goto release_imports;
+				}
+				task->session->core_dma[i] = core_dma;
+			}
+			buffer = rkvenc_dma_import_fd(core->iommu_info, core_dma, fd, 0);
+			if (IS_ERR(buffer)) {
+				ret = PTR_ERR(buffer);
+				goto release_imports;
+			}
+			mem_region->core_hdl[i] = buffer;
+		}
+		buffer = mem_region->core_hdl[mpp->core_id];
 		mem_region->hdl = buffer;
 		mem_region->iova = buffer->iova;
 		mem_region->len = buffer->size;
 		mem_region->fd = fd;
 		mem_region->reg_class = 0;
 		mem_region->is_dup = false;
+		goto imported;
+
+release_imports:
+		for (i = 0; i < RKVENC_MAX_CORE_NUM; i++) {
+			buffer = mem_region->core_hdl[i];
+			if (buffer)
+				rkvenc_dma_release(buffer->dma, buffer);
+			mem_region->core_hdl[i] = NULL;
+		}
+		return ERR_PTR(ret);
 	}
+imported:
 	task->mem_count++;
 	INIT_LIST_HEAD(&mem_region->reg_link);
 	list_add_tail(&mem_region->reg_link, &task->mem_region_list);

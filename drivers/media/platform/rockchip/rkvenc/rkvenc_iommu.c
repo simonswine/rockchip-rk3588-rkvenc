@@ -183,8 +183,28 @@ rkvenc_dma_import_fd(struct rkvenc_iommu_info *iommu_info,
 		rkvenc_err("dma_buf_map_attachment fd %d failed(%d)\n", fd, ret);
 		goto fail_map;
 	}
+	/* Registers describe a single 32-bit linear DMA address range. */
+	{
+		struct scatterlist *sg;
+		dma_addr_t end = sg_dma_address(sgt->sgl);
+		u64 size = 0;
+		int i;
+
+		for_each_sgtable_dma_sg(sgt, sg, i) {
+			if (sg_dma_address(sg) != end) {
+				ret = -EINVAL;
+				goto fail_unmap;
+			}
+			size += sg_dma_len(sg);
+			end += sg_dma_len(sg);
+		}
+		if (size < dmabuf->size || (u64)end > BIT_ULL(32)) {
+			ret = -ERANGE;
+			goto fail_unmap;
+		}
+	}
 	buffer->iova = sg_dma_address(sgt->sgl);
-	buffer->size = sg_dma_len(sgt->sgl);
+	buffer->size = dmabuf->size;
 	buffer->attach = attach;
 	buffer->sgt = sgt;
 	buffer->dma = dma;
@@ -204,6 +224,8 @@ rkvenc_dma_import_fd(struct rkvenc_iommu_info *iommu_info,
 
 	return buffer;
 
+fail_unmap:
+	dma_buf_unmap_attachment(attach, sgt, buffer->dir);
 fail_map:
 	dma_buf_detach(buffer->dmabuf, attach);
 fail_attach:
@@ -322,10 +344,11 @@ int rkvenc_iommu_attach(struct rkvenc_iommu_info *info)
 	if (!info)
 		return 0;
 
-	if (info->domain == iommu_get_domain_for_dev(info->dev))
-		return 0;
+	/* Never switch a DMA device away from the domain backing its mappings. */
+	if (info->domain != iommu_get_domain_for_dev(info->dev))
+		return -EINVAL;
 
-	return iommu_attach_group(info->domain, info->group);
+	return 0;
 }
 
 int rkvenc_iommu_flush_tlb(struct rkvenc_iommu_info *info)
@@ -417,7 +440,7 @@ struct rkvenc_iommu_info *rkvenc_iommu_probe(struct device *dev)
 	}
 
 	domain = iommu_get_domain_for_dev(dev);
-	if (!domain) {
+	if (!domain || domain->cookie_type != IOMMU_COOKIE_DMA_IOVA) {
 		ret = -EINVAL;
 		goto err_put_group;
 	}

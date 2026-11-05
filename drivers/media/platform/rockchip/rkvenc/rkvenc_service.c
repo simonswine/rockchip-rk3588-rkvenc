@@ -58,9 +58,12 @@ static void rkvenc_session_deinit(struct rkvenc_session *session)
 	if (!session)
 		return;
 
-	if (session->dma) {
-		rkvenc_dma_session_destroy(session->dma);
-		session->dma = NULL;
+	{
+		int i;
+
+		for (i = 0; i < RKVENC_MAX_CORE_NUM; i++)
+			if (session->core_dma[i])
+				rkvenc_dma_session_destroy(session->core_dma[i]);
 	}
 
 	if (session->priv) {
@@ -83,6 +86,7 @@ static int rkvenc_session_attach_device(struct rkvenc_session *session,
 		return -ENOMEM;
 	}
 
+	session->core_dma[mpp->core_id] = session->dma;
 	return 0;
 }
 
@@ -561,6 +565,21 @@ static int rkvenc_result(struct rkvenc_dev *mpp,
 	return 0;
 }
 
+/* Replace main-core IOVAs with the selected core's DMA mappings. */
+static void rkvenc_place_task(struct rkvenc_task *task, int core_id)
+{
+	struct rkvenc_mem_region *mr;
+
+	list_for_each_entry(mr, &task->mpp_task.mem_region_list, reg_link) {
+		u32 *reg = task->reg[mr->reg_class].data;
+		struct rkvenc_dma_buffer *buffer = mr->core_hdl[core_id];
+
+		reg[mr->reg_idx] = reg[mr->reg_idx] - mr->iova + buffer->iova;
+		if (task->bs_buf == mr->hdl)
+			task->bs_buf = buffer;
+	}
+}
+
 /* ---- Task ISR bottom half (called from kthread worker) ---- */
 void rkvenc_task_worker_default(struct kthread_work *work)
 {
@@ -644,6 +663,8 @@ void rkvenc_task_worker_default(struct kthread_work *work)
 								   struct rkvenc_task,
 								   mpp_task);
 			int run_ret;
+
+			rkvenc_place_task(enc_task, target->core_id);
 
 			/* Set RCB buffers if SRAM available */
 			rkvenc2_set_rcbbuf(target, pending_task->session, enc_task);

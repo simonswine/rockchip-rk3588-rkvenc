@@ -317,8 +317,9 @@ struct rkvenc_mem_region {
 	u32 reg_class;
 	u32 reg_idx;
 	bool is_dup;
-	/* handle from DMA session */
+	/* Import into every usable core before returning from submission. */
 	void *hdl;
+	struct rkvenc_dma_buffer *core_hdl[RKVENC_MAX_CORE_NUM];
 };
 
 /* ---- Offset info for register address offsets ---- */
@@ -590,7 +591,9 @@ struct rkvenc_session {
 	struct rkvenc_dev *mpp;
 	struct rkvenc_service *srv;
 	enum MPP_DEVICE_TYPE device_type;
+	/* Main-core cache for pre-import ioctls, plus per-core task mappings. */
 	struct rkvenc_dma_session *dma;
+	struct rkvenc_dma_session *core_dma[RKVENC_MAX_CORE_NUM];
 
 	struct mutex pending_lock;
 	struct list_head pending_list;

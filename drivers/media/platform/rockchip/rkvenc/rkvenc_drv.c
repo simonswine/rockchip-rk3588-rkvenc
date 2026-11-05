@@ -86,44 +86,9 @@ static int rkvenc_attach_ccu(struct device *dev, struct rkvenc_dev *enc)
 	list_add_tail(&enc->core_link, &ccu->core_list);
 	mutex_unlock(&ccu->lock);
 
-	/* First core becomes the main core */
-	if (!ccu->main_core) {
+	/* Keep each core in its DMA API domain; imports follow task placement. */
+	if (!ccu->main_core)
 		ccu->main_core = enc;
-	} else {
-		struct rkvenc_iommu_info *main_iommu =
-			ccu->main_core ? ccu->main_core->iommu_info : NULL;
-		struct rkvenc_iommu_info *sec_iommu = enc->iommu_info;
-		struct iommu_domain *shared;
-		int ret;
-
-		shared = main_iommu ? main_iommu->domain : NULL;
-		if (!shared || !sec_iommu || !sec_iommu->group) {
-			dev_err(dev, "missing IOMMU info for shared domain\n");
-			return -ENODEV;
-		}
-
-		/*
-		 * Share the main core's IOMMU domain with the secondary core.
-		 * This programs the secondary IOMMU hardware to use the same
-		 * page tables as the main core (matching BSP mpp_rkvenc2.c).
-		 *
-		 * All DMA buffer imports go through the main core's device
-		 * (via session->mpp which is always the main core), so mappings
-		 * land in main_core->default_domain.  We do NOT need to modify
-		 * iommu_get_dma_domain() because no DMA API calls are ever
-		 * made through the secondary core's device.
-		 */
-		sec_iommu->domain = shared;
-		sec_iommu->rw_sem = main_iommu->rw_sem;
-
-		ret = iommu_attach_group(shared, sec_iommu->group);
-		if (ret) {
-			dev_err(dev, "attach shared IOMMU domain failed: %d\n", ret);
-			sec_iommu->domain = NULL;
-			sec_iommu->rw_sem = &sec_iommu->rw_sem_self;
-			return ret;
-		}
-	}
 	enc->ccu = ccu;
 
 	dev_info(dev, "attach ccu as core %d%s\n", enc->core_id,
@@ -241,6 +206,9 @@ static int rkvenc_core_probe(struct platform_device *pdev)
 		enc->core_id = core_id;
 	}
 
+	if (enc->core_id < 0 || enc->core_id >= RKVENC_MAX_CORE_NUM)
+		return -EINVAL;
+
 	/* HW probe: clocks, resets, IOMMU, register space */
 	ret = rkvenc_hw_probe(enc, pdev);
 	if (ret)
@@ -260,25 +228,11 @@ static int rkvenc_core_probe(struct platform_device *pdev)
 		goto err_hw;
 	}
 
-	/*
-	 * Only allocate through the main core's DMA device: the secondary
-	 * core is attached to its domain, but does not own its DMA allocator.
-	 * The managed allocation is released after hardware removal.
-	 */
-	if (enc->ccu && enc != enc->ccu->main_core &&
-	    enc->ccu->main_core->sram_used) {
-		enc->sram_iova = enc->ccu->main_core->sram_iova;
-		enc->sram_size = enc->ccu->main_core->sram_size;
-		enc->sram_used = enc->ccu->main_core->sram_used;
-		enc->sram_enabled = -1;
-		dev_info(dev, "sram inherited from main core: iova %pad size %u used %u\n",
-			 &enc->sram_iova, enc->sram_size, enc->sram_used);
-	} else {
-		ret = rkvenc2_alloc_rcbbuf(pdev, enc);
-		if (ret) {
-			dev_err(dev, "RCB DMA allocation failed: %d\n", ret);
-			goto err_hw;
-		}
+	/* Concurrent frames must not share writable RCB scratch storage. */
+	ret = rkvenc2_alloc_rcbbuf(pdev, enc);
+	if (ret) {
+		dev_err(dev, "RCB DMA allocation failed: %d\n", ret);
+		goto err_hw;
 	}
 
 	/* Register IRQ */
