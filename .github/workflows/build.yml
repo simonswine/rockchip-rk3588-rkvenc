@@ -1,0 +1,31 @@
+name: Kernel module builds
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  module:
+    name: ARM64 / Linux ${{ matrix.kernel }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ["6_12", "6_18", "7_3"]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - name: Build module against configured kernel and symbol versions
+        run: nix build -L --no-update-lock-file ".#checks.aarch64-linux.linux-${{ matrix.kernel }}"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rkvenc-linux-${{ matrix.kernel }}-arm64
+          path: result/lib/modules/*/extra/rkvenc.ko
+          if-no-files-found: error

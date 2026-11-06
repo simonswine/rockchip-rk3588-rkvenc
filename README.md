@@ -41,6 +41,27 @@ package this source through `kernel.moduleBuildDependencies` and install the
 module under `lib/modules/<kernel-version>/extra/` instead of modifying the
 running system's store paths.
 
+## Nix builds and CI
+
+The flake pins nixpkgs in `flake.lock` and builds against its Linux 6.12 and
+6.18 kernels and the latest pinned 7.3.x kernel, including their configured headers and symbol versions. On a
+native ARM64 Linux host:
+
+```sh
+nix build .#linux-6_12 -L
+nix build .#linux-6_18 -L
+nix build .#linux-7_3 -L
+# Build all checks:
+nix flake check -L
+```
+
+Modules are installed under `result/lib/modules/<version>/extra/rkvenc.ko`.
+GitHub Actions runs each kernel build separately on `ubuntu-24.04-arm` and
+uploads successful modules as artifacts. These are compile/link checks, not
+hardware tests; artifacts must match the target kernel configuration to load.
+The Linux 6.12 check is expected to fail until the driver's newer IOMMU cookie
+API usage is made compatible. Update the pinned kernels with `nix flake update`.
+
 ## Device tree and runtime
 
 `rk3588-rkvenc.dtso` supplies the hardware nodes for an Orange Pi 5 Plus.
