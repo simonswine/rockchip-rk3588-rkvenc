@@ -21,6 +21,7 @@
 #include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
+#include <linux/version.h>
 
 #include "rkvenc_hw.h"
 
@@ -409,4 +410,8 @@ module_platform_driver(rkvenc_driver);
 MODULE_DESCRIPTION("Rockchip VEPU580 (RKVENC v2) H.265/H.264/JPEG encoder driver");
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("Rockchip Electronics Co., Ltd.");
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS(DMA_BUF);
+#else
 MODULE_IMPORT_NS("DMA_BUF");
+#endif

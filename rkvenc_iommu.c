@@ -16,6 +16,7 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/pm_runtime.h>
+#include <linux/version.h>
 
 #include "rkvenc_hw.h"
 
@@ -403,7 +404,12 @@ int rkvenc_iommu_dev_activate(struct rkvenc_iommu_info *info, struct rkvenc_dev 
 	}
 
 	info->dev_active = dev;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 15, 0)
+	/* Before 6.15, the fault handler did not share the DMA cookie union. */
+	if (info->domain)
+#else
 	if (info->domain && info->domain->cookie_type == IOMMU_COOKIE_NONE)
+#endif
 		iommu_set_fault_handler(info->domain, rkvenc_iommu_fault_handler, dev);
 
 	spin_unlock_irqrestore(&info->dev_lock, flags);
@@ -454,7 +460,11 @@ struct rkvenc_iommu_info *rkvenc_iommu_probe(struct device *dev)
 	}
 
 	domain = iommu_get_domain_for_dev(dev);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 15, 0)
+	if (!domain || !iommu_is_dma_domain(domain) || !domain->iova_cookie) {
+#else
 	if (!domain || domain->cookie_type != IOMMU_COOKIE_DMA_IOVA) {
+#endif
 		ret = -EINVAL;
 		goto err_put_group;
 	}

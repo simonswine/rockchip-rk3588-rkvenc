@@ -59,8 +59,8 @@ Modules are installed under `result/lib/modules/<version>/extra/rkvenc.ko`.
 GitHub Actions runs each kernel build separately on `ubuntu-24.04-arm` and
 uploads successful modules as artifacts. These are compile/link checks, not
 hardware tests; artifacts must match the target kernel configuration to load.
-The Linux 6.12 check is expected to fail until the driver's newer IOMMU cookie
-API usage is made compatible. Update the pinned kernels with `nix flake update`.
+Compatibility guards support the pre-6.15 IOMMU cookie API and pre-6.13 module
+namespace imports. Update the pinned kernels with `nix flake update`.
 
 ## Device tree and runtime
 
